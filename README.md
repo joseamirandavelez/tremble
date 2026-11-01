@@ -66,3 +66,7 @@ From this folder:
 If the Stick does not appear in `ports`, put it in bootloader mode by holding the power button for a few seconds, then run `upload` again. After the upload finishes, reboot the Stick by pressing the power button once.
 
 The firmware targets the StickS3: ESP32-S3, 8 MB flash, 8 MB PSRAM, BMI270 on I2C. It is a screening tool. It is not a calibrated laboratory accelerometer, and it cannot see ultrasonic bearing frequencies.
+
+## License
+
+Tremble is released under the [MIT license](LICENSE).
