@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tremble</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="app">
+    <header class="top">
+      <div class="brand">
+        <img class="brand-logo" src="/logo.svg" alt="Tremble. Vibration analysis.">
+        <div class="brand-copy">
+          <p id="conn">Connecting to the Stick…</p>
+          <p id="deviceStatus">Checking the Stick…</p>
+        </div>
+      </div>
+      <button id="recBtn" class="record" type="button">Start</button>
+    </header>
+    <div id="banner" class="banner" hidden></div>
+    <div id="recBar" class="rec-bar" hidden>
+      <div class="rec-bar-top">
+        <span id="recBarLabel">Recording. Leave the Stick alone.</span>
+        <span id="recBarTime"></span>
+      </div>
+      <div class="bar" id="recBarMeter" role="progressbar" aria-valuemin="0" aria-valuemax="100"><span id="recBarFill"></span></div>
+    </div>
+    <nav class="tabs" role="tablist">
+      <button type="button" data-tab="live" aria-selected="true">Live</button>
+      <button type="button" data-tab="capture">Settings</button>
+      <button type="button" data-tab="analyze">Analyze</button>
+      <button type="button" data-tab="files">Files</button>
+      <button type="button" data-tab="guide">Guide</button>
+    </nav>
+    <div class="deck">
+    <div class="live-side">
+    <div class="row tools">
+      <button id="livePause" class="ghost" type="button" aria-pressed="false">Pause</button>
+      <label class="field">Units
+        <select id="units">
+          <option value="metric" selected>Metric (g, mm/s)</option>
+          <option value="us">US (in/s^2, in/s)</option>
+        </select>
+      </label>
+      <label class="field">Signal
+        <select id="liveQty">
+          <option value="accel" selected>Acceleration</option>
+          <option value="velocity">Velocity</option>
+          <option value="displacement">Displacement</option>
+        </select>
+      </label>
+      <label class="field grow">EMA weight <span id="emaLabel">off</span>
+        <input id="ema" type="range" min="0" max="0.9" step="0.05" value="0">
+      </label>
+      <label class="field grow">Noise gate <span id="gateLabel">off</span>
+        <input id="gate" type="range" min="0" max="0.05" step="0.001" value="0">
+      </label>
+      <label class="field">Chart update
+        <select id="feedRate">
+          <option value="slow">Slow</option>
+          <option value="steady" selected>Steady</option>
+          <option value="fast">Fast</option>
+        </select>
+      </label>
+      <label class="field">FFT window
+        <select id="fftWin">
+          <option>128</option>
+          <option>256</option>
+          <option selected>512</option>
+        </select>
+      </label>
+      <label class="field check"><input id="logF" type="checkbox"> Log frequency</label>
+      <label class="field check"><input id="markPeaks" type="checkbox"> Spectrum peaks</label>
+      <label class="field check"><input id="decayEnv" type="checkbox"> Decay envelope</label>
+      <label class="field">Sensitivity <span id="liveRangeLabel">±2 g</span>
+        <input id="liveRange" type="range" min="0" max="3" step="1" value="0">
+      </label>
+    </div>
+      <article class="card levels">
+        <div class="level-grid">
+          <span>RSS</span><span><b id="rss">-</b> <span class="unit live-unit">g</span></span>
+          <span class="x">X</span><span><b id="rx">-</b> <span class="unit live-unit">g</span></span>
+          <span class="y">Y</span><span><b id="ry">-</b> <span class="unit live-unit">g</span></span>
+          <span class="z">Z</span><span><b id="rz">-</b> <span class="unit live-unit">g</span></span>
+        </div>
+        <p class="s" id="rateLive"></p>
+        <p class="s" id="rangeLive"></p>
+        <p class="s" id="peakLive"></p>
+        <p class="s" id="gyroLive"></p>
+        <p class="s" id="noiseLive"></p>
+        <p class="s" id="livePeak">Live spectrum appears as the sensor moves.</p>
+        <div class="damp" id="dampGauge">
+          <div class="damp-head">
+            <span>Q</span><b id="dampQ">-</b>
+            <span>ζ</span><b id="dampZ">-</b>
+          </div>
+          <div class="damp-bar" id="dampBar" role="meter" aria-valuemin="0" aria-valuemax="40" aria-valuenow="0" aria-label="Quality factor"><span id="dampFill"></span></div>
+          <p class="s" id="dampNote">Half-power of the live acceleration peak.</p>
+        </div>
+      </article>
+    </div>
+
+    <section id="live" class="panel active">
+      <div class="live-charts">
+        <canvas id="liveCanvas" class="plot"></canvas>
+        <canvas id="liveSpecCanvas" class="plot"></canvas>
+        <div class="row live-zoom">
+          <label class="field">Time window
+            <select id="liveSpan">
+              <option value="0" selected>All</option>
+              <option value="0.25">0.25 s</option>
+              <option value="0.5">0.5 s</option>
+              <option value="1">1 s</option>
+              <option value="2">2 s</option>
+            </select>
+          </label>
+          <label class="field">Hz from<input id="liveFmin" type="number" min="0" step="any" placeholder="auto"></label>
+          <label class="field">Hz to<input id="liveFmax" type="number" min="0" step="any" placeholder="auto"></label>
+        </div>
+        <p class="s chart-hint">Click a curve, or its name, to select it. The scale follows that curve. Click the name again to clear it. Time window and the Hz boxes zoom the live charts.</p>
+      </div>
+    </section>
+
+    <section id="capture" class="panel">
+      <div class="block">
+        <h2>Recording</h2>
+        <p>Mount the Stick, let it settle, then start from this page. The buttons on the device are ignored, because pressing them shakes the measurement.</p>
+        <div class="row">
+          <button type="button" class="ghost" data-preset="structure">Structure</button>
+          <button type="button" class="ghost" data-preset="machine">Machine</button>
+          <button type="button" class="ghost" data-preset="impact">Impact</button>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <label class="field">Sample rate
+            <select id="rate">
+              <option>100</option><option>200</option><option>400</option>
+              <option selected>800</option><option>1600</option>
+            </select>
+          </label>
+          <label class="field">Range
+            <select id="range"><option>2</option><option>4</option><option>8</option><option>16</option></select>
+          </label>
+          <label class="field">Seconds (0 = until Stop)
+            <input id="seconds" type="number" min="0" max="120" value="10">
+          </label>
+          <label class="field check"><input id="gyro" type="checkbox"> Log gyroscope (±2000 °/s)</label>
+          <button id="apply" class="solid" type="button">Apply</button>
+          <button id="resetSettings" class="ghost" type="button">Reset to defaults</button>
+        </div>
+        <p class="s">Reset puts this page and the Stick back to 800 Hz, ±2 g, and 10 seconds. The lab network is cleared. Saved captures stay.</p>
+        <p id="capMeta"></p>
+        <div class="cal">
+          <h2>Noise floor</h2>
+          <p>Set the Stick on a rigid surface, like the floor. Wait until it is still, then measure. Do not touch it.</p>
+          <div class="row">
+            <button id="calStart" class="solid" type="button">Measure noise</button>
+            <button id="calGate" class="ghost" type="button" hidden>Use as noise gate</button>
+            <button id="calClear" class="ghost" type="button" hidden>Clear</button>
+          </div>
+          <div id="calLevels" class="level-grid" hidden>
+            <span>RSS</span><span><b id="calRss">-</b> <span class="unit" id="calUnit">g</span></span>
+            <span class="x">X</span><span><b id="calX">-</b> <span class="unit cal-unit">g</span></span>
+            <span class="y">Y</span><span><b id="calY">-</b> <span class="unit cal-unit">g</span></span>
+            <span class="z">Z</span><span><b id="calZ">-</b> <span class="unit cal-unit">g</span></span>
+          </div>
+          <p id="calResult" class="s"></p>
+        </div>
+      </div>
+      <div class="block">
+        <h2>Join another network</h2>
+        <p>The Stick always keeps its own Tremble network. Optionally it can also join a lab router so a computer already on that network can open the page.</p>
+        <div class="row">
+          <label class="field">Network name<input id="staSsid" autocomplete="off"></label>
+          <label class="field">Password<input id="staPass" type="password" autocomplete="off"></label>
+          <button id="saveWifi" class="ghost" type="button">Save network</button>
+        </div>
+        <p id="netInfo"></p>
+      </div>
+      <div class="block">
+        <h2>Other ways in</h2>
+        <p>The charts and exports are this website, over the Stick's Wi-Fi. A tethered computer can also type commands on the USB serial port at 115200 baud. Bluetooth advertises as <strong>Tremble</strong> and uses the Nordic UART service. The commands are the same: <code>status</code>, <code>start</code>, <code>stop</code>, <code>rate</code>, <code>range</code>, <code>seconds</code>, <code>gyro on</code>, <code>wifi</code>.</p>
+        <p>A CSV from another logger can be dropped on Analyze. Use columns named x, y, and z, in g, and a <code>sample_rate_hz</code> comment if there is no time column.</p>
+      </div>
+    </section>
+
+    <section id="analyze" class="panel">
+      <div class="block tune">
+        <div class="row">
+          <label class="field">High-pass Hz<input id="hp" type="number" min="0" max="200" step="0.1" value="0.5"></label>
+          <label class="field">Low-pass Hz (0 = off)<input id="lp" type="number" min="0" max="800" step="1" value="0"></label>
+          <label class="field">View
+            <select id="quantity">
+              <option value="accel">Acceleration</option>
+              <option value="velocity">Velocity</option>
+              <option value="displacement">Displacement</option>
+              <option value="gyro">Gyroscope</option>
+            </select>
+          </label>
+          <label class="field"><span>Channels</span>
+            <span class="checks">
+              <label><input id="chX" type="checkbox" checked> X</label>
+              <label><input id="chY" type="checkbox" checked> Y</label>
+              <label><input id="chZ" type="checkbox" checked> Z</label>
+              <label><input id="chRss" type="checkbox"> RSS</label>
+              <label><input id="logSpec" type="checkbox"> Log amplitude</label>
+              <label><input id="showRaw" type="checkbox" checked> Raw under filtered</label>
+            </span>
+          </label>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <label class="field">X shows<select id="mapX"></select></label>
+          <label class="field">Y shows<select id="mapY"></select></label>
+          <label class="field">Z shows<select id="mapZ"></select></label>
+        </div>
+        <div class="row timeline" style="margin-top:10px">
+          <button id="play" class="ghost" type="button">Play</button>
+          <label class="field">Window
+            <select id="span">
+              <option value="0">All</option>
+              <option value="0.25">0.25 s</option>
+              <option value="0.5">0.5 s</option>
+              <option value="1">1 s</option>
+              <option value="2">2 s</option>
+              <option value="5">5 s</option>
+            </select>
+          </label>
+          <label class="field grow">Timeline
+            <input id="scrub" type="range" min="0" max="1000" value="0">
+          </label>
+          <span id="scrubLabel" class="s"></span>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <label class="field"><input id="displacement" type="checkbox"> Estimate displacement</label>
+          <button id="reanalyze" class="ghost" type="button">Reanalyze</button>
+          <label class="ghost">Open file<input id="openFile" type="file" accept=".vibe,.csv,.txt" hidden></label>
+        </div>
+        <div id="drop" class="drop" style="margin-top:10px">Drop a .vibe capture or a CSV from another sensor.</div>
+      </div>
+      <div class="two">
+        <div class="block">
+          <div class="plots">
+            <canvas id="waveCanvas" class="plot"></canvas>
+            <canvas id="specCanvas" class="plot"></canvas>
+            <canvas id="gramCanvas" class="plot"></canvas>
+          </div>
+          <div class="row chart-foot">
+            <label class="field">Spectrogram
+              <select id="stftWin">
+                <option>128</option>
+                <option selected>256</option>
+                <option>512</option>
+                <option>1024</option>
+              </select>
+            </label>
+            <label class="field">Time from<input id="tFrom" type="number" min="0" step="any" placeholder="auto"></label>
+            <label class="field">Time to<input id="tTo" type="number" min="0" step="any" placeholder="auto"></label>
+            <label class="field">Y min<input id="yMin" type="number" step="any" placeholder="auto"></label>
+            <label class="field">Y max<input id="yMax" type="number" step="any" placeholder="auto"></label>
+            <label class="field">Hz from<input id="fMin" type="number" min="0" step="any" placeholder="auto"></label>
+            <label class="field">Hz to<input id="fMax" type="number" min="0" step="any" placeholder="auto"></label>
+            <label class="field">Spectrum max<input id="specMax" type="number" min="0" step="any" placeholder="auto"></label>
+            <label class="field check"><input id="grid" type="checkbox" checked> Grid</label>
+          </div>
+        </div>
+        <div class="block side">
+          <h2 id="srcLabel">No capture yet</h2>
+          <div id="metrics"></div>
+          <h3>Peaks</h3>
+          <div id="peaks"></div>
+          <div id="resonance"></div>
+          <div class="row">
+            <button id="baseSet" class="ghost" type="button">Set baseline</button>
+            <button id="baseClear" class="ghost" type="button">Clear baseline</button>
+          </div>
+          <p id="baseline"></p>
+          <ul id="notes" class="notes"></ul>
+          <div class="row">
+            <button id="expPng" class="solid" type="button">PNG report</button>
+            <button id="expCsv" class="ghost" type="button">CSV raw + filtered</button>
+            <button id="expSpec" class="ghost" type="button">Spectrum CSV</button>
+            <button id="expJson" class="ghost" type="button">JSON</button>
+            <button id="expFea" class="ghost" type="button">FEA CSV</button>
+            <button id="expAll" class="ghost" type="button">Export set</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="files" class="panel">
+      <div class="block">
+        <h2>On the Stick</h2>
+        <div class="bar" title="Flash used"><span id="usedBar"></span></div>
+        <p id="usedText"></p>
+        <div class="row">
+          <label class="field">Save the latest capture as
+            <input id="fileName" placeholder="beam-a" maxlength="24">
+          </label>
+          <button id="saveFile" class="solid" type="button">Save</button>
+        </div>
+        <ul id="fileList" class="files"></ul>
+      </div>
+    </section>
+
+    <section id="guide" class="panel help">
+      <div class="block">
+        <img class="guide-logo" src="/logo.svg" alt="Tremble. Vibration analysis.">
+        <h2>How to take a reading</h2>
+        <ol>
+          <li>Clamp or stick the magnetic back to a rigid part of the structure. A hand-held reading is the motion of your hand.</li>
+          <li>Wait a few seconds so the mount stops ringing.</li>
+          <li>Press <strong>Start</strong> on this page. Do not touch the Stick, and do not press its buttons, until the capture finishes.</li>
+          <li>Open Analyze. Export a PNG for a report, or CSV if you want the samples in another program.</li>
+        </ol>
+        <h2>What the numbers mean</h2>
+        <ul>
+          <li><strong>RMS</strong> is the steady vibration level. Gravity and the resting tilt are removed before it is calculated.</li>
+          <li><strong>Peak</strong> and <strong>crest factor</strong> (peak ÷ RMS) rise when the motion is impulsive rather than sinusoidal. A sine wave has a crest factor near 1.41.</li>
+          <li><strong>Velocity</strong> is acceleration divided by frequency. Metric units are mm/s. US units are in/s. Machinery standards such as ISO 20816 use velocity RMS, and the limit depends on the machine. Compare the same point over time.</li>
+          <li>The <strong>spectrum</strong> uses a Hann window. A tone shows up as a peak at its frequency. The live spectrum is amplitude, so the axis starts at zero. Log amplitude, on Analyze, is dB relative to the peak, and those numbers sit at or below zero. Log frequency spreads the low structural modes apart.</li>
+          <li>Click a curve, or its name, to select it. Click the name again to clear it. Click the plot to add a point on that curve. Drag the point along the curve, or right-click it to remove it.</li>
+          <li>The <strong>spectrogram</strong> shows how those tones fade or shift after a tap. Color is strength. Time runs left to right.</li>
+          <li><strong>EMA</strong> weight runs from off to 0.9. Higher follows the samples more closely, so a lower weight is the smoother line. The noise gate draws quiet samples as zero, on the live trace and on a saved capture. The spectrogram keeps the samples before the gate, so a gate does not cut stripes out of it. Raw samples can sit under the filtered line.</li>
+          <li><strong>Live feed:</strong> Pause freezes the charts on the last samples. Chart update controls how often the page asks the Stick for new samples. Steady is the default. Slow is easier on the hotspot when the page keeps dropping. The trace crosses zero because gravity is already removed, so a still Stick wanders a little above and below. While it is running, the time axis slides forward with the clock. Spectrum peaks marks each frequency the live spectrum finds.</li>
+          <li><strong>Signal</strong> switches both charts to acceleration, velocity, or displacement, and the scale fits that one. They are not drawn on top of each other, because a few g and a few mm/s are not the same size. Click a curve name and the scale follows that axis. Metric units are mm/s and µm. US units are in/s and inches.</li>
+          <li><strong>Zoom:</strong> Time window and the Hz boxes crop the live charts. On Analyze, Time from, Time to, Hz from, and Hz to do the same for a saved capture.</li>
+          <li><strong>Decay envelope</strong> draws the curve a clean ring would follow. The fit uses the raw samples, before the EMA smoother. Smoothing first flattens the hit and makes the damping look too high. If the trace pokes through the lines, the motion is not a clean log decay. A rattle does that.</li>
+          <li><strong>Q and ζ</strong> come from the half-power width of the live acceleration peak, again on the raw samples. A high Q is a long ring. The bar turns amber when the ring is light, and blue when it dies quickly.</li>
+          <li><strong>Noise floor:</strong> set the Stick on a rigid surface, like the floor, and measure. That RMS is how quiet this sensor is. Use it as the noise gate and the live trace lays that fuzz on zero.</li>
+          <li><strong>RSS</strong> is the size of the vibration on all three axes together, so the mounting direction matters less.</li>
+          <li><strong>Damping</strong> is estimated from the half-power width of the strongest peak. Set a baseline before a change, then compare the next capture.</li>
+          <li>The <strong>timeline</strong> plays the capture back. Pick a short window to inspect one tap.</li>
+          <li><strong>Axis remap</strong> relabels the sensor axes when the Stick is mounted on its side.</li>
+          <li><strong>Displacement</strong> integrates a second time. Treat it as an estimate. Gyroscope values are degrees per second at ±2000.</li>
+        </ul>
+        <h2>Limits of this sensor</h2>
+        <p>The StickS3 uses a Bosch BMI270. It is a useful screening instrument for students and for field checks. It is not a calibrated laboratory accelerometer. Keep spectral conclusions below about 45% of the sample rate; the sensor's digital filter rolls off before the Nyquist frequency. Very small structural motion can sit near the sensor noise. The highest rate is 1600 Hz, so this cannot see ultrasonic bearing frequencies.</p>
+        <h2>Suggested starts</h2>
+        <ul>
+          <li><strong>Structure:</strong> 400 Hz, ±2 g, 30 s, high-pass 0.3 Hz.</li>
+          <li><strong>Machine:</strong> 1600 Hz, ±8 g, 10 s, high-pass 2 Hz, low-pass 500 Hz.</li>
+          <li><strong>Impact:</strong> 1600 Hz, ±16 g, a few seconds, high-pass 1 Hz.</li>
+        </ul>
+        <p>Saved files use the <code>.vibe</code> format. CSV, JSON, and PNG are created in the browser from that capture.</p>
+      </div>
+    </section>
+    </div>
+  </div>
+  <script src="/dsp.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
