@@ -2,7 +2,9 @@
 
 #include <stdint.h>
 
-// Little-endian capture file. Keep in sync with web/dsp.js parseVibe().
+// On-disk capture format (.vibe). Little-endian, fixed 64-byte header.
+// Keep field layout in sync with web/dsp.js parseVibe(). Gyro captures may
+// set version 2 in the writer while VIBE_VERSION stays 1 for the constant.
 //
 //  0  char     magic[4]          "VIBE"
 //  4  uint16   version           1

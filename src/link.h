@@ -1,6 +1,6 @@
 #pragma once
 
-// USB serial and Bluetooth Low Energy. Both accept the same text commands.
-// Recording still does not use the Stick's buttons.
+// USB serial at 115200. One command per line; replies are a single println.
+// SoftAP can also be toggled from the Stick button or "ap on|off" here.
 void linkBegin();
 void linkLoop();

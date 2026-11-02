@@ -10,7 +10,7 @@ Recording starts and stops from the website. The buttons on the Stick are not us
 2. Join the Wi-Fi network **Tremble**, password **tremble1**.
 3. Open **http://192.168.4.1**.
 
-The screen shows the address, the live RMS, and whether a capture is running. Leave the Stick alone while it says REC.
+The screen shows the Wi-Fi name, password, 192.168.4.1, tremble.local, and whether a capture is running. Leave the Stick alone while it says REC.
 
 If you also save a lab network on the Capture page, the Stick joins that network and keeps the Tremble network at the same time. On the lab network the page is at `http://tremble.local` when mDNS works, or at the address shown on the screen.
 

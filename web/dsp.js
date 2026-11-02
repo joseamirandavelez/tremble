@@ -3,6 +3,7 @@
   const G = 9.80665;
   const HP_FIX = Math.pow(Math.SQRT2 - 1, 0.25);
 
+  /* Binary layout must match include/vibe_format.h on the Stick firmware. */
   function parseVibe(buffer) {
     const view = new DataView(buffer);
     if (buffer.byteLength < 64) throw new Error("File is too small");
@@ -47,6 +48,7 @@
     return y;
   }
 
+  /* Second-order Butterworth biquad; HP_FIX prewarps cutoff for bilinear filtfilt. */
   function butterworth(kind, fs, fc) {
     let design = kind === "hp" ? fc * HP_FIX : fc / HP_FIX;
     const ny = fs * 0.45;
@@ -99,6 +101,7 @@
     return y;
   }
 
+  /* Zero-phase filtering: forward-backward pass with reflective padding at edges. */
   function filtfilt(b, a, x, pad) {
     const padded = padReflect(x, pad);
     let y = biquad(b, a, padded);
@@ -108,6 +111,7 @@
     return y.slice(pad, pad + x.length);
   }
 
+  /* HP removes DC/tilt; if HP is off, subtract mean only. LP optional below Nyquist guard. */
   function shape(x, fs, hp, lp) {
     let y = x;
     if (hp > 0 && hp < fs * 0.45) {
@@ -155,6 +159,7 @@
     };
   }
 
+  /* Drop transients at start/end so metrics are not dominated by mount settling. */
   function center(a, fs) {
     const trim = Math.min(Math.floor(a.length / 4), Math.ceil(fs * 0.5));
     if (a.length - trim * 2 < 16) return a;
@@ -213,6 +218,7 @@
     }
   }
 
+  /* Hann window + one-sided amplitude spectrum; cg normalizes coherent gain. */
   function spectrumOf(x, fs) {
     const n = x.length;
     const nfft = Math.min(nextPow2(n), 262144);
@@ -261,6 +267,7 @@
     return picked;
   }
 
+  /* Frequency-domain integration (velocity or displacement) with high-pass in Hz. */
   function integrateSpectrum(x, fs, fmin, order, fmax) {
     const n = x.length;
     const nfft = nextPow2(n);
@@ -356,6 +363,67 @@
     return { columns, bins, df: fs / nfft, hop, win, mag, fs };
   }
 
+  /* Greedy peak linking across STFT columns for Campbell-style mode lines. */
+  function modeTracks(spec, options) {
+    if (!spec || !spec.mag || spec.columns < 2 || !(spec.df > 0)) return [];
+    const opt = options || {};
+    const fMin = opt.fMin > 0 ? opt.fMin : spec.df;
+    const fMax = opt.fMax > fMin ? opt.fMax : spec.df * (spec.bins - 1);
+    const columns = [];
+    for (let c = 0; c < spec.columns; c++) {
+      const amp = spec.mag.subarray(c * spec.bins, (c + 1) * spec.bins);
+      columns.push(topPeaks(amp, spec.df, fMin, fMax));
+    }
+    const tracks = [];
+    const gap = Math.max(spec.df * 3, 1);
+    for (let c = 0; c < columns.length; c++) {
+      const peaks = columns[c];
+      const open = tracks.filter((track) => track.missed < 2);
+      const pairs = [];
+      open.forEach((track) => {
+        const last = track.points[track.points.length - 1];
+        let best = -1;
+        let bestD = Infinity;
+        peaks.forEach((peak, index) => {
+          const tol = Math.max(gap, last.hz * 0.06);
+          const d = Math.abs(peak.hz - last.hz);
+          if (d <= tol && d < bestD) {
+            bestD = d;
+            best = index;
+          }
+        });
+        if (best >= 0) pairs.push({ track, index: best, d: bestD });
+      });
+      pairs.sort((a, b) => a.d - b.d);
+      const used = new Set();
+      const linked = new Set();
+      pairs.forEach((pair) => {
+        if (linked.has(pair.track) || used.has(pair.index)) return;
+        linked.add(pair.track);
+        used.add(pair.index);
+        const peak = peaks[pair.index];
+        pair.track.points.push({ c, hz: peak.hz, amp: peak.amp });
+        pair.track.missed = 0;
+      });
+      open.forEach((track) => {
+        if (!linked.has(track)) track.missed++;
+      });
+      if (open.length >= 8) continue;
+      peaks.forEach((peak, index) => {
+        if (used.has(index)) return;
+        tracks.push({ points: [{ c, hz: peak.hz, amp: peak.amp }], missed: 0 });
+      });
+    }
+    const tOf = (c) => (c * spec.hop + spec.win * 0.5) / spec.fs;
+    return tracks
+      .filter((track) => track.points.length >= 3)
+      .map((track) => ({
+        points: track.points.map((point) => ({ t: tOf(point.c), hz: point.hz, amp: point.amp })),
+      }))
+      .sort((a, b) => b.points[0].amp - a.points[0].amp)
+      .slice(0, 6);
+  }
+
   function applyMap(raw, map) {
     if (!map || map.length !== 3) return raw;
     return map.map((spec) => {
@@ -427,6 +495,7 @@
     return y;
   }
 
+  /* Full offline pipeline: filter, optional EMA/gate, integrate, spectrum, and notes. */
   function processCapture(parsed, options) {
     const fs = parsed.sampleRate;
     const hp = Number(options.highpassHz) || 0;
@@ -455,6 +524,7 @@
       ], options.axes);
     }
     const means = raw.map(mean);
+    /* Which axis sits nearest 1 g after mean removal hints at gravity direction. */
     let vertical = "X";
     if (Math.abs(Math.abs(means[1]) - 1) < Math.abs(Math.abs(means[0]) - 1)) vertical = "Y";
     if (Math.abs(Math.abs(means[2]) - 1) < Math.abs(Math.abs(means[vertical === "Y" ? 1 : 0]) - 1)) vertical = "Z";
@@ -578,6 +648,7 @@
     return full.dynamic;
   }
 
+  /* Re-run spectrum and accel metrics on a timeline window without re-parsing the file. */
   function focus(full, start, count) {
     const n = full.dynamic.x.length;
     let a = Math.max(0, start | 0);
@@ -630,6 +701,7 @@
     return { x, y, z };
   }
 
+  /* Live path: mean-remove only (Stick/firmware already scaled); no filtfilt on short windows. */
   function liveAccel(samples, count, lsb) {
     const scale = 1 / (lsb > 1 ? lsb : 16384);
     return asSeries([
@@ -654,6 +726,7 @@
     return ampG;
   }
 
+  /* Log-decay fit on successive peaks; rejects growing or messy envelopes. */
   function decayFit(x, fs) {
     const n = x ? x.length : 0;
     if (n < 32 || !(fs > 0)) return null;
@@ -750,6 +823,7 @@
     return resonanceOf(amp, df, peaks[0]);
   }
 
+  /* Short-window spectrum for live charts; optional gate, EMA, and integration order. */
   function liveLook(samples, count, lsb, fs, options) {
     const opt = options || {};
     let series = liveAccel(samples, count, lsb);
@@ -765,6 +839,6 @@
 
   root.VibeDSP = {
     G, parseVibe, processCapture, focus, liveLook, liveAccel, integrateSeries, envelopeAmp,
-    decayOf, halfPower, spectrogram, spectrumSet, conditionSeries, topPeaks,
+    decayOf, halfPower, spectrogram, modeTracks, spectrumSet, conditionSeries, topPeaks,
   };
 })(globalThis);

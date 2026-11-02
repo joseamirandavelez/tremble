@@ -1,14 +1,37 @@
+// NVS preferences for capture defaults and lab Wi-Fi. Finished .vibe files
+// live under LittleFS /captures. Writes yield every 8 KiB so IMU/Wi-Fi keep
+// time while flash is busy.
+
 #include "store.h"
 
 #include "vibe_format.h"
 
+#include <Arduino.h>
 #include <LittleFS.h>
 #include <Preferences.h>
+#include <freertos/semphr.h>
 #include <stdio.h>
 #include <string.h>
 
 static Settings gSettings = {800, 2, 10, 0, "", ""};
 static Preferences gPrefs;
+static SemaphoreHandle_t gFs = nullptr;
+static volatile bool gFsBusy = false;
+static uint32_t gUsedCache = 0;
+static uint32_t gTotalCache = 0;
+static bool gUsedFresh = false;
+static uint8_t gCopy[1024];
+
+void storeLock() {
+  if (!gFs) gFs = xSemaphoreCreateRecursiveMutex();
+  xSemaphoreTakeRecursive(gFs, portMAX_DELAY);
+  gFsBusy = true;
+}
+
+void storeUnlock() {
+  gFsBusy = false;
+  if (gFs) xSemaphoreGiveRecursive(gFs);
+}
 
 static bool allowedRate(uint16_t rate) {
   return rate == 100 || rate == 200 || rate == 400 || rate == 800 || rate == 1600;
@@ -48,13 +71,32 @@ void settingsSaveWifi() {
 }
 
 bool storeBegin() {
-  if (LittleFS.begin(false)) return true;
-  if (!LittleFS.format()) return false;
-  return LittleFS.begin(true);
+  if (!gFs) gFs = xSemaphoreCreateRecursiveMutex();
+  bool ok = LittleFS.begin(false);
+  if (!ok) {
+    if (!LittleFS.format()) return false;
+    ok = LittleFS.begin(true);
+  }
+  if (!ok) return false;
+  gTotalCache = (uint32_t)LittleFS.totalBytes();
+  gUsedCache = (uint32_t)LittleFS.usedBytes();
+  gUsedFresh = true;
+  return true;
 }
 
-uint32_t storeUsed() { return (uint32_t)LittleFS.usedBytes(); }
-uint32_t storeTotal() { return (uint32_t)LittleFS.totalBytes(); }
+uint32_t storeUsed() {
+  if (gFsBusy || !gFs) return gUsedCache;
+  if (xSemaphoreTakeRecursive(gFs, 0) != pdTRUE) return gUsedCache;
+  if (!gUsedFresh) {
+    gUsedCache = (uint32_t)LittleFS.usedBytes();
+    gUsedFresh = true;
+  }
+  uint32_t used = gUsedCache;
+  xSemaphoreGiveRecursive(gFs);
+  return used;
+}
+
+uint32_t storeTotal() { return gTotalCache; }
 
 void settingsAllocStem(char* out, int outLen) {
   uint32_t seq = gPrefs.getUInt("seq", 1);
@@ -63,9 +105,12 @@ void settingsAllocStem(char* out, int outLen) {
 }
 
 bool storeExists(const char* stem) {
-  char path[40];
+  char path[48];
   if (!storePath(stem, path, sizeof(path))) return false;
-  return LittleFS.exists(path);
+  storeLock();
+  bool exists = LittleFS.exists(path);
+  storeUnlock();
+  return exists;
 }
 
 bool storeValidStem(const char* stem) {
@@ -88,42 +133,82 @@ bool storePath(const char* stem, char* out, int outLen) {
 }
 
 bool storeSave(const char* stem, const uint8_t* header, const int16_t* samples, uint32_t count) {
-  char path[40];
-  if (!storePath(stem, path, sizeof(path))) return false;
-  if (!LittleFS.exists("/captures")) LittleFS.mkdir("/captures");
-  File file = LittleFS.open(path, "w");
-  if (!file) return false;
-  bool ok = file.write(header, VIBE_HEADER_BYTES) == VIBE_HEADER_BYTES;
+  char path[48];
+  if (!header || !storePath(stem, path, sizeof(path))) return false;
   size_t body = (size_t)count * vibeSampleBytes(header);
+  if (body && !samples) return false;
+  storeLock();
+  if (!LittleFS.exists("/captures")) LittleFS.mkdir("/captures");
+  size_t freeBytes = LittleFS.totalBytes() - LittleFS.usedBytes();
+  if (LittleFS.exists(path)) {
+    File old = LittleFS.open(path, "r");
+    if (old) {
+      freeBytes += old.size();
+      old.close();
+    }
+  }
+  if (freeBytes < VIBE_HEADER_BYTES + body) {
+    storeUnlock();
+    return false;
+  }
+  File file = LittleFS.open(path, "w");
+  if (!file) {
+    storeUnlock();
+    return false;
+  }
+  bool ok = file.write(header, VIBE_HEADER_BYTES) == VIBE_HEADER_BYTES;
   const uint8_t* p = (const uint8_t*)samples;
+  size_t sinceYield = 0;
   while (ok && body) {
-    size_t chunk = body > 1024 ? 1024 : body;
-    size_t n = file.write(p, chunk);
+    size_t chunk = body > sizeof(gCopy) ? sizeof(gCopy) : body;
+    memcpy(gCopy, p, chunk);
+    size_t n = file.write(gCopy, chunk);
     if (n == 0) {
       ok = false;
       break;
     }
     p += n;
     body -= n;
+    sinceYield += n;
+    if (sinceYield >= 8192) {
+      sinceYield = 0;
+      delay(1);
+    }
   }
   file.close();
   if (!ok || body != 0) {
     LittleFS.remove(path);
+    storeUnlock();
     return false;
   }
+  gUsedFresh = false;
+  storeUnlock();
   return true;
 }
 
 bool storeDelete(const char* stem) {
-  char path[40];
+  char path[48];
   if (!storePath(stem, path, sizeof(path))) return false;
-  return LittleFS.remove(path);
+  storeLock();
+  bool exists = LittleFS.exists(path);
+  bool gone = !exists || LittleFS.remove(path) || !LittleFS.exists(path);
+  if (gone) gUsedFresh = false;
+  storeUnlock();
+  return gone;
 }
 
 int storeList(StoreEntry* out, int max) {
-  if (!LittleFS.exists("/captures")) return 0;
+  storeLock();
+  if (!LittleFS.exists("/captures")) {
+    storeUnlock();
+    return 0;
+  }
   File dir = LittleFS.open("/captures");
-  if (!dir || !dir.isDirectory()) return 0;
+  if (!dir || !dir.isDirectory()) {
+    if (dir) dir.close();
+    storeUnlock();
+    return 0;
+  }
   int n = 0;
   for (File file = dir.openNextFile(); file && n < max; file = dir.openNextFile()) {
     const char* path = file.name();
@@ -145,5 +230,6 @@ int storeList(StoreEntry* out, int max) {
     file.close();
   }
   dir.close();
+  storeUnlock();
   return n;
 }

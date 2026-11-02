@@ -1,5 +1,7 @@
 #pragma once
 
+// IMU samples land here: live metrics, optional PSRAM capture, HTTP export.
+
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -27,6 +29,8 @@ struct LiveSnap {
 bool captureBegin();
 // Returns false when the PSRAM buffer cannot hold the requested channels.
 bool captureApply(uint32_t rateHz, uint8_t rangeG, float lsbPerG, uint16_t seconds, bool gyro, float lsbPerDps);
+// Drop samples for a short settle after the IMU is actually reconfigured.
+void captureHold(uint32_t ms);
 bool captureStart();
 void captureStop();
 void capturePush(int16_t x, int16_t y, int16_t z, int16_t gx, int16_t gy, int16_t gz);
@@ -37,6 +41,9 @@ void captureAddGaps(uint32_t n);
 // The trace is about 100 Hz. Each point keeps the strongest sample in that slice
 // so a short shock is not skipped between draws.
 uint16_t captureCopyWave(float* xyz, uint16_t max, float* dt);
+
+// Same live trace as captureCopyWave, packed as int16 milli-g for SoftAP.
+uint16_t captureCopyWaveMilliG(int16_t* xyz, uint16_t max, float* dt);
 
 // Newest raw accelerometer samples, oldest first. Used for the live spectrum.
 uint16_t captureCopyRecent(int16_t* out, uint16_t max, uint32_t* rate, float* lsb);

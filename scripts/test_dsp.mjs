@@ -166,6 +166,23 @@ const hp = dsp.halfPower(looked.spectrum.x, looked.spectrum.df, 1, 200);
 console.log("half power", hp);
 assert(hp && Math.abs(hp.hz - 40) < 1.5, "half-power frequency, got " + (hp && hp.hz));
 assert(hp && hp.damping > 0.01 && hp.damping < 0.08, "half-power zeta, got " + (hp && hp.damping));
+assert(hp && hp.damping > 0.01 && hp.damping < 0.08, "half-power zeta, got " + (hp && hp.damping));
+
+const chirpN = 800 * 4;
+const chirp = new Float32Array(chirpN);
+for (let i = 0; i < chirpN; i++) {
+  const t = i / 800;
+  chirp[i] = 0.4 * Math.sin(2 * Math.PI * (40 * t + 1.875 * t * t));
+  chirp[i] += 0.25 * Math.sin(2 * Math.PI * 120 * t);
+}
+const chirpGram = dsp.spectrogram(chirp, 800, { win: 256 });
+const tracked = dsp.modeTracks(chirpGram, { fMin: 10, fMax: 200 });
+const rising = tracked.find((track) => track.points[track.points.length - 1].hz > track.points[0].hz + 6);
+const steadyTone = tracked.find((track) => Math.abs(track.points[0].hz - 120) < 8 && Math.abs(track.points[track.points.length - 1].hz - 120) < 8);
+console.log("tracks", tracked.map((track) => [track.points[0].hz.toFixed(1), track.points[track.points.length - 1].hz.toFixed(1), track.points.length]));
+assert(rising, "a rising chirp should become one tracked mode");
+assert(steadyTone, "a steady tone should stay on its own track");
+
 const ampG = 0.5;
 const wn = 2 * Math.PI * 40;
 assert(Math.abs(dsp.envelopeAmp(ampG, wn, 0) - ampG) < 1e-9, "accel envelope stays in g");

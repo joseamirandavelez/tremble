@@ -1,3 +1,6 @@
+// Web UI baked into the firmware image (objcopy embed from web/). No LittleFS
+// copy is required at runtime; sendAsset streams straight from flash.
+
 #include "assets.h"
 
 #include <string.h>
@@ -24,6 +27,7 @@ struct Asset {
   const uint8_t* end;
 };
 
+// Embedded blobs often include a trailing NUL from the linker; do not send it.
 static size_t assetLength(const uint8_t* start, const uint8_t* end) {
   size_t n = (size_t)(end - start);
   if (n && start[n - 1] == 0) n--;

@@ -21,7 +21,7 @@ Tremble
 
   .\tremble.cmd ports            List USB serial devices
   .\tremble.cmd build            Compile the firmware
-  .\tremble.cmd upload           Flash the StickS3
+  .\tremble.cmd upload           Flash the StickS3 (no bootloader needed)
   .\tremble.cmd monitor          Open the serial monitor
   .\tremble.cmd run              Flash the StickS3, then open the monitor
   .\tremble.cmd test             Check the browser vibration math
@@ -30,10 +30,9 @@ Tremble
   .\tremble.cmd upload -Port COM5
   .\tremble.cmd upload -Port COM5 -Force
 
-The Stick is chosen by its USB id. A Tab5 on the same PC is never flashed
-unless -Port and -Force are both given. If the Stick does not appear, put it
-in bootloader mode by holding the power button for a few seconds. After it
-is uploaded, reboot the Stick by pressing the power button once.
+Upload uses the Stick's ESP32-S3 USB-JTAG port when it is present, so you do
+not need to hold the power button for bootloader mode. A Tab5 on the same PC
+is never flashed unless -Port and -Force are both given.
 
 '@
 }
@@ -56,9 +55,9 @@ function Get-DeviceRole {
 function Get-DeviceLabel {
     param($Device)
     switch ($Device.Role) {
-        'Stick' { return 'StickS3' }
+        'Stick' { return 'StickS3 CDC' }
         'StickBoot' { return 'StickS3 UF2 bootloader' }
-        'Jtag' { return 'ESP32-S3 USB-JTAG' }
+        'Jtag' { return 'StickS3 USB-JTAG' }
         'Tab5' { return 'M5Stack Tab5' }
         'OtherEspressif' { return 'other Espressif board' }
         default { return 'other USB serial' }
@@ -96,50 +95,82 @@ function Show-Ports {
     foreach ($device in $Devices) {
         $label = Get-DeviceLabel $device
         $note = ''
-        if ($device.Role -eq 'Tab5' -or $device.Role -eq 'OtherEspressif' -or $device.Role -eq 'Other') {
+        if ($device.Role -eq 'Jtag') {
+            $note = '  (preferred for upload)'
+        } elseif ($device.Role -eq 'Tab5' -or $device.Role -eq 'OtherEspressif' -or $device.Role -eq 'Other') {
             $note = '  (left alone)'
         }
         Write-Host ("{0,-6} {1}:{2}  {3}{4}" -f $device.Port, $device.Vid, $device.Product, $label, $note)
     }
 }
 
-function Select-StickPort {
+function Resolve-RequestedPort {
+    param($Devices, [string]$Requested, [switch]$AllowOther)
+    $wanted = $Requested.ToUpper()
+    $match = $Devices | Where-Object { $_.Port -eq $wanted } | Select-Object -First 1
+    if (-not $match) {
+        throw "No USB serial device is on $wanted. Run: .\tremble.cmd ports"
+    }
+    if ($match.Role -eq 'Stick' -or $match.Role -eq 'Jtag' -or $match.Role -eq 'StickBoot') {
+        return $match
+    }
+    if (-not $AllowOther) {
+        $label = Get-DeviceLabel $match
+        throw "$($match.Port) is $label ($($match.Vid):$($match.Product)). Plug in the StickS3, or pass -Force to override."
+    }
+    Write-Host "Override: using $($match.Port), which is $(Get-DeviceLabel $match)."
+    return $match
+}
+
+function Select-OneRole {
+    param($Devices, [string]$Role, [string]$ManyMessage)
+    $hits = @($Devices | Where-Object { $_.Role -eq $Role })
+    if ($hits.Count -eq 1) { return $hits[0] }
+    if ($hits.Count -gt 1) { throw $ManyMessage }
+    return $null
+}
+
+# USB-JTAG (PID 1001) can flash a running Stick without holding the power
+# button. CDC often needs bootloader mode, so upload prefers JTAG first.
+function Select-UploadPort {
     param($Devices, [string]$Requested, [switch]$AllowOther)
 
     if ($Requested) {
-        $wanted = $Requested.ToUpper()
-        $match = $Devices | Where-Object { $_.Port -eq $wanted } | Select-Object -First 1
-        if (-not $match) {
-            throw "No USB serial device is on $wanted. Run: .\tremble.cmd ports"
-        }
-        if ($match.Role -eq 'Stick' -or $match.Role -eq 'Jtag') { return $match }
-        if (-not $AllowOther) {
-            $label = Get-DeviceLabel $match
-            throw "$($match.Port) is $label ($($match.Vid):$($match.Product)). Plug in the StickS3, or pass -Force to override."
-        }
-        Write-Host "Override: flashing $($match.Port), which is $(Get-DeviceLabel $match)."
-        return $match
+        return Resolve-RequestedPort $Devices $Requested -AllowOther:$AllowOther
     }
 
-    $sticks = @($Devices | Where-Object { $_.Role -eq 'Stick' })
-    if ($sticks.Count -eq 1) { return $sticks[0] }
-    if ($sticks.Count -gt 1) {
-        throw "More than one StickS3 is connected. Pass -Port COMx."
+    $jtag = Select-OneRole $Devices 'Jtag' 'More than one ESP32-S3 USB-JTAG port is connected. Pass -Port COMx.'
+    if ($jtag) { return $jtag }
+
+    $boot = Select-OneRole $Devices 'StickBoot' 'More than one StickS3 bootloader port is connected. Pass -Port COMx.'
+    if ($boot) { return $boot }
+
+    $stick = Select-OneRole $Devices 'Stick' 'More than one StickS3 CDC port is connected. Pass -Port COMx.'
+    if ($stick) {
+        Write-Host "No USB-JTAG port found. Flashing CDC $($stick.Port). If this fails, reconnect USB-C so USB-JTAG appears."
+        return $stick
     }
 
-    $jtag = @($Devices | Where-Object { $_.Role -eq 'Jtag' })
-    if ($jtag.Count -eq 1) { return $jtag[0] }
-    if ($jtag.Count -gt 1) {
-        throw "More than one ESP32-S3 USB-JTAG port is connected. Pass -Port COMx."
+    throw "StickS3 not found. Plug it in over USB-C and run: .\tremble.cmd ports"
+}
+
+function Select-MonitorPort {
+    param($Devices, [string]$Requested, [switch]$AllowOther)
+
+    if ($Requested) {
+        return Resolve-RequestedPort $Devices $Requested -AllowOther:$AllowOther
     }
 
-    $boots = @($Devices | Where-Object { $_.Role -eq 'StickBoot' })
-    if ($boots.Count -ge 1) {
-        $names = ($boots | ForEach-Object { $_.Port }) -join ', '
-        throw "StickS3 is in the UF2 bootloader on $names. Put it in bootloader mode by holding the power button for a few seconds, then try again."
-    }
+    $stick = Select-OneRole $Devices 'Stick' 'More than one StickS3 CDC port is connected. Pass -Port COMx.'
+    if ($stick) { return $stick }
 
-    throw "StickS3 not found. Plug it in over USB-C. If it still does not appear, put it in bootloader mode by holding the power button for a few seconds."
+    $jtag = Select-OneRole $Devices 'Jtag' 'More than one ESP32-S3 USB-JTAG port is connected. Pass -Port COMx.'
+    if ($jtag) { return $jtag }
+
+    $boot = Select-OneRole $Devices 'StickBoot' 'More than one StickS3 bootloader port is connected. Pass -Port COMx.'
+    if ($boot) { return $boot }
+
+    throw "StickS3 not found. Plug it in over USB-C and run: .\tremble.cmd ports"
 }
 
 function Get-PioCommand {
@@ -171,17 +202,20 @@ function Invoke-Pio {
 
 function Invoke-Upload {
     param($Devices)
-    $target = Select-StickPort $Devices $Port -AllowOther:$Force
+    $target = Select-UploadPort $Devices $Port -AllowOther:$Force
     $label = Get-DeviceLabel $target
     Write-Host "Flashing $($target.Port) ($($target.Vid):$($target.Product), $label)."
+    if ($target.Role -eq 'Jtag') {
+        Write-Host "USB-JTAG upload: bootloader mode is not required."
+    }
     Invoke-Pio @('run', '-t', 'upload', '--upload-port', $target.Port)
-    Write-Host "Upload finished. Reboot the Stick by pressing the power button once."
+    Write-Host "Upload finished. The Stick should reset on its own."
 }
 
 function Invoke-Monitor {
     param($Devices)
-    $target = Select-StickPort $Devices $Port -AllowOther:$Force
-    Write-Host "Monitoring $($target.Port). Press Ctrl+C to stop."
+    $target = Select-MonitorPort $Devices $Port -AllowOther:$Force
+    Write-Host "Monitoring $($target.Port) ($(Get-DeviceLabel $target)). Press Ctrl+C to stop."
     Invoke-Pio @('device', 'monitor', '--port', $target.Port)
 }
 
@@ -206,8 +240,7 @@ switch ($Action) {
         Invoke-Monitor (Get-SerialDevices)
     }
     'run' {
-        $devices = Get-SerialDevices
-        Invoke-Upload $devices
+        Invoke-Upload (Get-SerialDevices)
         Invoke-Monitor (Get-SerialDevices)
     }
     'test' {

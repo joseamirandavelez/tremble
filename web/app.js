@@ -1,3 +1,6 @@
+/* Tremble browser UI. Talks to the Stick over HTTP; heavy DSP lives in dsp.js (VibeDSP). */
+
+/* Shared UI state. live/liveSpec come from polls; result/focus from offline VibeDSP on captures. */
 const state = {
   status: null,
   recording: false,
@@ -16,12 +19,15 @@ const state = {
   ssidSeen: false,
   paused: false,
   netBusy: false,
+  fileBusy: false,
+  filesEtag: "",
   linkMisses: 0,
   liveClock: performance.now(),
   liveAt: 0,
   playTimer: 0,
 };
 
+/* Capture presets: rate, range, seconds, and default analyze filters. */
 const PRESETS = {
   structure: { rate: "400", range: "2", seconds: 30, hp: 0.3, lp: 40 },
   machine: { rate: "1600", range: "8", seconds: 10, hp: 2, lp: 500 },
@@ -29,6 +35,7 @@ const PRESETS = {
 };
 
 const COLORS = { x: "#ff8d8d", y: "#8ee0a8", z: "#8cbcff", rss: "#f0b429" };
+const MODE_COLORS = ["#f0b429", "#8cbcff", "#ff8d8d", "#8ee0a8", "#d2a8ff", "#f2a27a"];
 const chartMarks = {};
 const chartProbes = {};
 const chartRedraw = {};
@@ -36,6 +43,8 @@ let markSeq = 1;
 let chartDrag = null;
 let chartHoverId = "";
 let chartSkipClick = false;
+
+/* --- Tabs and layout --- */
 
 function $(id) { return document.getElementById(id); }
 
@@ -55,14 +64,36 @@ async function post(url, fields) {
   return data;
 }
 
+/* Live vs Analyze share one .tools row; DOM order follows the active tab layout in app.css. */
+function placeAnalyzeTools(name) {
+  const tools = document.querySelector(".tools");
+  const tune = document.querySelector(".tune");
+  const liveSide = document.querySelector(".live-side");
+  const levels = document.querySelector(".levels");
+  if (!tools || !tune || !liveSide) return;
+  if (name === "analyze") {
+    if (tools.parentElement !== tune) {
+      const stick = tune.querySelector(".stick-files");
+      if (stick) tune.insertBefore(tools, stick);
+      else tune.appendChild(tools);
+    }
+  } else if (tools.parentElement !== liveSide) {
+    liveSide.insertBefore(tools, levels || null);
+  }
+}
+
+/* Legacy tab ids from older builds map to analyze/live. */
 function showTab(name) {
+  if (name === "files" || name === "capture") name = name === "files" ? "analyze" : "live";
+  closeChart();
   document.querySelectorAll("nav.tabs button").forEach((btn) => {
     btn.setAttribute("aria-selected", btn.dataset.tab === name ? "true" : "false");
   });
   document.querySelectorAll(".panel").forEach((panel) => {
     panel.classList.toggle("active", panel.id === name);
   });
-  if (name === "files") refreshFiles();
+  placeAnalyzeTools(name);
+  if (name === "analyze") refreshFiles().catch(() => syncFileTools());
   if (name === "analyze" && state.result) refreshView();
   else drawAll();
   requestAnimationFrame(drawAll);
@@ -80,6 +111,7 @@ function banner(text, ready) {
   el.textContent = text;
 }
 
+/* Map selects encode physical axis (+0..+2) and sign for Stick mounting. */
 function axisSpec(id) {
   const raw = $(id).value || "+0";
   return { axis: Number(raw.slice(1)), sign: raw[0] === "-" ? -1 : 1 };
@@ -111,6 +143,7 @@ function usesUs() {
   return $("units") && $("units").value === "us";
 }
 
+/* US units convert at display/export time; VibeDSP stays in g, mm/s, and µm. */
 function displayScale(quantity) {
   if (!usesUs()) return 1;
   if (quantity === "velocity") return 1 / 25.4;
@@ -127,6 +160,8 @@ function unitName(quantity) {
   if (q === "gyro") return "dps";
   return us ? "in/s^2" : "g";
 }
+
+/* --- Canvas charts (shared by Live and Analyze) --- */
 
 function fit(canvas) {
   const ratio = Math.min(window.devicePixelRatio || 1, 2);
@@ -214,6 +249,14 @@ function logTicks(lo, hi) {
   return pinEnds(mid, lo, hi, true);
 }
 
+function tickEdge(v, lo, hi) {
+  const span = Math.abs(hi - lo) || 1;
+  if (Math.abs(v - lo) <= span * 1e-4) return "min";
+  if (Math.abs(v - hi) <= span * 1e-4) return "max";
+  return "";
+}
+
+/* Plot frame: margins, linear/log scales, tick labels, and clickable axis edges. */
 function drawFrame(ctx, w, h, opt) {
   const box = { left: 74, right: w - 16, top: 32, bottom: h - 44 };
   const plotW = Math.max(8, box.right - box.left);
@@ -257,7 +300,7 @@ function drawFrame(ctx, w, h, opt) {
   const legendHits = [];
   if (opt.legend) {
     const items = ["x", "y", "z", "rss"].filter((key) => opt.legend[key]);
-    let lx = box.right - items.length * 54;
+    let lx = box.right - 30 - items.length * 54;
     items.forEach((key) => {
       if (opt.selected === key) {
         ctx.strokeStyle = COLORS[key];
@@ -284,12 +327,23 @@ function drawFrame(ctx, w, h, opt) {
   ctx.fillText(opt.yTitle || "", 0, 0);
   ctx.restore();
   ctx.textAlign = "center";
-  ctx.fillText(opt.xTitle || "", (box.left + box.right) / 2, h - 8);
+  const xTitle = opt.xTitle || "";
+  let xTitleHit = null;
+  if (opt.edges && opt.edges.xTitle && xTitle) {
+    const width = ctx.measureText(xTitle).width;
+    const cx = (box.left + box.right) / 2;
+    xTitleHit = { x: cx - width / 2 - 10, y: h - 30, w: width + 20, h: 30 };
+    ctx.fillStyle = "#9ecbff";
+  }
+  ctx.fillText(xTitle, (box.left + box.right) / 2, h - 8);
+  ctx.fillStyle = "#93a0b3";
   ctx.strokeStyle = "#5c6b80";
   ctx.lineWidth = 1;
   ctx.strokeRect(box.left + 0.5, box.top + 0.5, plotW, plotH);
   const yTicks = logY ? logTicks(yMin, yMax) : tickValues(yMin, yMax, Math.max(3, Math.floor(plotH / 42)));
   const xTicks = logX ? logTicks(xMin, xMax) : tickValues(xMin, xMax, Math.max(3, Math.floor(plotW / 78)));
+  const axisHits = [];
+  const edges = opt.edges || {};
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
   yTicks.forEach((v) => {
@@ -307,15 +361,31 @@ function drawFrame(ctx, w, h, opt) {
     ctx.moveTo(box.left - 5, y);
     ctx.lineTo(box.left, y);
     ctx.stroke();
-    ctx.fillStyle = "#c9d3e2";
-    ctx.textBaseline = Math.abs(y - box.top) < 1 ? "top" : Math.abs(y - box.bottom) < 1 ? "bottom" : "middle";
-    ctx.fillText(tickLabel(v), box.left - 7, y);
+    const edge = tickEdge(v, yMin, yMax);
+    const which = edge === "min" ? "yMin" : edge === "max" ? "yMax" : "";
+    const label = tickLabel(v);
+    const baseline = Math.abs(y - box.top) < 1 ? "top" : Math.abs(y - box.bottom) < 1 ? "bottom" : "middle";
+    ctx.textBaseline = baseline;
+    ctx.fillStyle = which && edges[which] ? "#9ecbff" : "#c9d3e2";
+    ctx.fillText(label, box.left - 7, y);
+    if (which && edges[which]) {
+      const width = ctx.measureText(label).width;
+      const hgt = 14;
+      const top = baseline === "top" ? y - 1 : baseline === "bottom" ? y - hgt : y - hgt / 2;
+      axisHits.push({ edge: which, x: box.left - width - 12, y: top, w: width + 8, h: hgt + 2, value: v });
+      ctx.strokeStyle = "#9ecbff";
+      ctx.beginPath();
+      ctx.moveTo(box.left - width - 9, top + hgt);
+      ctx.lineTo(box.left - 9, top + hgt);
+      ctx.stroke();
+    }
   });
   ctx.textBaseline = "top";
   xTicks.forEach((v) => {
     const x = xOf(v);
     if (x < box.left - 0.5 || x > box.right + 0.5) return;
-    ctx.textAlign = x >= box.right - 1 ? "right" : x <= box.left + 1 ? "left" : "center";
+    const align = x >= box.right - 1 ? "right" : x <= box.left + 1 ? "left" : "center";
+    ctx.textAlign = align;
     if (opt.grid) {
       ctx.strokeStyle = "#243044";
       ctx.beginPath();
@@ -328,8 +398,21 @@ function drawFrame(ctx, w, h, opt) {
     ctx.moveTo(x, box.bottom);
     ctx.lineTo(x, box.bottom + 5);
     ctx.stroke();
-    ctx.fillStyle = "#c9d3e2";
-    ctx.fillText(tickLabel(v), x, box.bottom + 8);
+    const edge = tickEdge(v, xMin, xMax);
+    const which = edge === "min" ? "xMin" : edge === "max" ? "xMax" : "";
+    const label = tickLabel(v);
+    ctx.fillStyle = which && edges[which] ? "#9ecbff" : "#c9d3e2";
+    ctx.fillText(label, x, box.bottom + 8);
+    if (which && edges[which]) {
+      const width = ctx.measureText(label).width;
+      const left = align === "right" ? x - width : align === "center" ? x - width / 2 : x;
+      axisHits.push({ edge: which, x: left - 3, y: box.bottom + 6, w: width + 8, h: 16, value: v });
+      ctx.strokeStyle = "#9ecbff";
+      ctx.beginPath();
+      ctx.moveTo(left, box.bottom + 22);
+      ctx.lineTo(left + width, box.bottom + 22);
+      ctx.stroke();
+    }
   });
   if (yMin < 0 && yMax > 0 && !opt.log) {
     ctx.strokeStyle = "#3d4c63";
@@ -341,9 +424,94 @@ function drawFrame(ctx, w, h, opt) {
   ctx.textAlign = "left";
   ctx.textBaseline = "alphabetic";
   ctx.lineWidth = 1;
-  return { box, plotW, plotH, xOf, yOf, xFrom, xMin, xMax, yMin, yMax, legendHits };
+  return { box, plotW, plotH, xOf, yOf, xFrom, xMin, xMax, yMin, yMax, legendHits, axisHits, xTitleHit };
 }
 
+const chartAxes = {};
+
+function noteAxes(canvas, frame, opt) {
+  if (!canvas || !canvas.id) return;
+  if (!opt || !opt.axis || !frame) {
+    delete chartAxes[canvas.id];
+    return;
+  }
+  const edges = opt.edges || {};
+  chartAxes[canvas.id] = {
+    hits: (frame.axisHits || []).filter((hit) => edges[hit.edge]),
+    title: edges.xTitle ? frame.xTitleHit : null,
+    apply: opt.axis,
+  };
+}
+
+function axisAt(canvas, p) {
+  const axes = chartAxes[canvas.id];
+  if (!axes) return null;
+  const hit = axes.hits.find((item) => p.x >= item.x && p.x <= item.x + item.w && p.y >= item.y && p.y <= item.y + item.h);
+  if (hit) return hit;
+  const title = axes.title;
+  if (title && p.x >= title.x && p.x <= title.x + title.w && p.y >= title.y && p.y <= title.y + title.h) {
+    return { edge: "xTitle", x: title.x, y: title.y, w: title.w, h: title.h, value: null };
+  }
+  return null;
+}
+
+function axisEditText(v) {
+  if (!Number.isFinite(v)) return "";
+  const digits = Math.abs(v) >= 100 ? 1 : Math.abs(v) >= 1 ? 3 : 4;
+  return String(Math.round(v * 10 ** digits) / 10 ** digits);
+}
+
+function setLimit(id, raw) {
+  const el = $(id);
+  if (!el || el.value === raw) return;
+  el.value = raw;
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function limitAxis(map) {
+  return (edge, raw) => {
+    if (map[edge]) setLimit(map[edge], raw);
+  };
+}
+
+function openAxisEditor(canvas, p) {
+  const hit = axisAt(canvas, p);
+  if (!hit) return false;
+  const axes = chartAxes[canvas.id];
+  if (hit.edge === "xTitle") {
+    axes.apply("xTitle", "");
+    return true;
+  }
+  const input = $("axisEdit");
+  const rect = canvas.getBoundingClientRect();
+  const text = axisEditText(hit.value);
+  input.hidden = false;
+  input.style.left = (rect.left + hit.x) + "px";
+  input.style.top = (rect.top + hit.y - 2) + "px";
+  input.style.width = Math.max(72, hit.w + 10) + "px";
+  input.value = text;
+  input.dataset.orig = text;
+  input.dataset.edge = hit.edge;
+  input.dataset.canvas = canvas.id;
+  input.focus();
+  input.select();
+  return true;
+}
+
+function commitAxisEdit(cancel) {
+  const input = $("axisEdit");
+  if (!input || input.hidden) return;
+  const raw = input.value.trim();
+  const edge = input.dataset.edge;
+  const axes = chartAxes[input.dataset.canvas];
+  const orig = input.dataset.orig;
+  input.hidden = true;
+  if (cancel || !axes || raw === orig) return;
+  axes.apply(edge, raw);
+}
+
+/* Long captures decimate to vertical spans so canvas draw stays responsive. */
 function strokeTime(ctx, values, fs, t0, xMin, xMax, xOf, yOf, color) {
   const n = values.length;
   if (n < 2) return;
@@ -453,7 +621,9 @@ function drawWave(canvas, series, fs, show, extra) {
     grid: opt.grid !== false,
     legend: show,
     selected: picked,
+    edges: opt.edges,
   });
+  noteAxes(canvas, frame, opt);
   if (!series || !series.x || series.x.length < 2) {
     if (canvas.id) chartProbes[canvas.id] = null;
     ctx.fillStyle = "#93a0b3";
@@ -510,15 +680,20 @@ function drawWave(canvas, series, fs, show, extra) {
       ctx.restore();
     });
   }
-  ctx.lineWidth = 1;
-  if (Number.isFinite(opt.cursor) && opt.span === 0) {
-    const x = frame.xOf(opt.cursor);
-    ctx.strokeStyle = "#f0b429";
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = "#f0b429";
+  const marks = [];
+  if (opt.windowAt) opt.windowAt.forEach((t) => { if (Number.isFinite(t)) marks.push(t); });
+  else if (Number.isFinite(opt.cursor) && !(opt.span > 0)) marks.push(opt.cursor);
+  marks.forEach((t) => {
+    let x = frame.xOf(t);
+    if (x < frame.box.left + 1) x = frame.box.left + 1;
+    if (x > frame.box.right - 1) x = frame.box.right - 1;
     ctx.beginPath();
     ctx.moveTo(x, frame.box.top);
     ctx.lineTo(x, frame.box.bottom);
     ctx.stroke();
-  }
+  });
   ctx.restore();
   const probe = {
     kind: "wave",
@@ -609,7 +784,9 @@ function drawSpectrum(canvas, spectrum, logScale, show, extra) {
     legend: show,
     selected: picked,
     log: !!logScale,
+    edges: passed.edges,
   });
+  noteAxes(canvas, frame, passed);
   if (!spectrum) {
     if (canvas.id) chartProbes[canvas.id] = null;
     ctx.fillStyle = "#93a0b3";
@@ -751,7 +928,16 @@ function paintFreqPeaks(ctx, frame, peaks, yOfAmp, keys) {
 
 function heatColor(t) {
   const x = Math.max(0, Math.min(1, t));
-  const stops = [[22, 48, 86], [18, 70, 150], [24, 160, 150], [240, 176, 48], [255, 244, 220]];
+  // Jet: deep blue → cyan → green → yellow → orange → red
+  const stops = [
+    [0, 0, 128],
+    [0, 0, 255],
+    [0, 255, 255],
+    [0, 255, 0],
+    [255, 255, 0],
+    [255, 0, 0],
+    [128, 0, 0],
+  ];
   const p = x * (stops.length - 1);
   const i = Math.min(stops.length - 2, Math.floor(p));
   const f = p - i;
@@ -786,7 +972,9 @@ function drawSpectrogram(canvas, spec, extra) {
     yMax: fMax,
     yScale: logF ? "log" : "linear",
     grid: opt.grid !== false,
+    edges: opt.edges,
   });
+  noteAxes(canvas, frame, opt);
   if (!spec) {
     ctx.fillStyle = "#93a0b3";
     ctx.font = "13px Segoe UI, sans-serif";
@@ -796,6 +984,9 @@ function drawSpectrogram(canvas, spec, extra) {
   let peak = 0;
   for (let i = 0; i < spec.mag.length; i++) if (spec.mag[i] > peak) peak = spec.mag[i];
   if (!(peak > 0)) peak = 1;
+  // Last real FFT bin. Rows above this used to clamp to that one bin, which
+  // painted solid vertical bars across the top of the chart.
+  const dataMaxF = (spec.bins - 1) * spec.df;
   const cols = Math.max(1, Math.floor(frame.plotW));
   const rows = Math.max(1, Math.floor(frame.plotH));
   for (let x = 0; x < cols; x++) {
@@ -806,13 +997,154 @@ function drawSpectrogram(canvas, spec, extra) {
       const freq = logF
         ? Math.exp(Math.log(fMin) + frac * (Math.log(fMax) - Math.log(fMin)))
         : fMin + frac * (fMax - fMin);
+      if (!(freq >= 0) || freq > dataMaxF) continue;
       const bin = Math.max(0, Math.min(spec.bins - 1, Math.round(freq / spec.df)));
       const db = 20 * Math.log10(Math.max(spec.mag[base + bin], peak * 1e-7) / peak);
       ctx.fillStyle = heatColor((db + 70) / 70);
       ctx.fillRect(frame.box.left + x - 0.3, frame.box.top + y - 0.3, 1.6, 1.6);
     }
   }
+  if (opt.windowAt && opt.windowAt.length) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(frame.box.left, frame.box.top, frame.plotW, frame.plotH);
+    ctx.clip();
+    ctx.strokeStyle = "#f0b429";
+    ctx.lineWidth = 1.5;
+    opt.windowAt.forEach((t) => {
+      if (!Number.isFinite(t)) return;
+      let x = frame.xOf(t);
+      if (x < frame.box.left + 1) x = frame.box.left + 1;
+      if (x > frame.box.right - 1) x = frame.box.right - 1;
+      ctx.beginPath();
+      ctx.moveTo(x, frame.box.top);
+      ctx.lineTo(x, frame.box.bottom);
+      ctx.stroke();
+    });
+    ctx.restore();
+  }
 }
+
+function drawCampbell(canvas, spec, extra) {
+  const opt = extra || {};
+  const { ctx, w, h } = fit(canvas);
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#121820";
+  ctx.fillRect(0, 0, w, h);
+  const logF = !!opt.logF;
+  const df = spec && spec.df ? spec.df : 1;
+  let fMin = opt.fMin != null ? opt.fMin : 0;
+  const lp = state.result && state.result.lowpassHz;
+  const autoF = spec ? (lp > 0 ? lp : spec.fs * 0.45) : 50;
+  let fMax = opt.fMax != null ? opt.fMax : autoF;
+  if (logF && !(fMin > 0)) fMin = Math.max(df, 0.5);
+  if (!(fMax > fMin)) fMax = fMin + 1;
+  const t0 = opt.t0 || 0;
+  const seconds = spec ? ((spec.columns - 1) * spec.hop + spec.win) / spec.fs : 1;
+  const t1 = t0 + Math.max(seconds, 0.01);
+  const rpm0 = readNum("rpmFrom");
+  const rpm1 = readNum("rpmTo");
+  const runUp = rpm0 != null && rpm1 != null && Math.abs(rpm1 - rpm0) > 0.5;
+  const steady = !runUp && rpm0 != null && rpm0 > 0;
+  const xOfT = (t) => {
+    if (!runUp) return t;
+    return rpm0 + ((t - t0) / (t1 - t0)) * (rpm1 - rpm0);
+  };
+  const frame = drawFrame(ctx, w, h, {
+    title: runUp ? "Campbell diagram" : "Mode tracks",
+    xTitle: runUp ? "Speed (RPM)" : "Time (s)",
+    yTitle: logF ? "Frequency (Hz, log)" : "Frequency (Hz)",
+    xMin: runUp ? Math.min(rpm0, rpm1) : t0,
+    xMax: runUp ? Math.max(rpm0, rpm1) : t1,
+    yMin: fMin,
+    yMax: fMax,
+    yScale: logF ? "log" : "linear",
+    grid: opt.grid !== false,
+    edges: opt.edges,
+  });
+  noteAxes(canvas, frame, opt);
+  if (!spec) {
+    ctx.fillStyle = "#93a0b3";
+    ctx.font = "13px Segoe UI, sans-serif";
+    ctx.fillText("Open a capture to follow the modes", frame.box.left + 12, frame.box.top + 28);
+    return;
+  }
+  const tracks = VibeDSP.modeTracks(spec, { fMin, fMax });
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(frame.box.left, frame.box.top, frame.plotW, frame.plotH);
+  ctx.clip();
+  const orders = [];
+  if (runUp || steady) {
+    const lo = runUp ? Math.min(rpm0, rpm1) : rpm0;
+    const hi = runUp ? Math.max(rpm0, rpm1) : rpm0;
+    for (let n = 1; n <= 12 && orders.length < 8; n++) {
+      const fLo = (n * lo) / 60;
+      const fHi = (n * hi) / 60;
+      if (Math.max(fLo, fHi) < fMin || Math.min(fLo, fHi) > fMax) continue;
+      orders.push(n);
+    }
+  }
+  ctx.setLineDash([5, 4]);
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = "rgba(147,160,179,0.9)";
+  ctx.font = "11px Segoe UI, sans-serif";
+  ctx.fillStyle = "#93a0b3";
+  orders.forEach((n) => {
+    const f0 = (n * rpm0) / 60;
+    const f1 = (n * (runUp ? rpm1 : rpm0)) / 60;
+    ctx.beginPath();
+    ctx.moveTo(frame.xOf(xOfT(t0)), frame.yOf(f0));
+    ctx.lineTo(frame.xOf(runUp ? xOfT(t1) : t1), frame.yOf(f1));
+    ctx.stroke();
+    const labelY = frame.yOf(f1);
+    if (labelY > frame.box.top + 12 && labelY < frame.box.bottom - 2) {
+      ctx.fillText(n + "x", frame.box.right - 26, labelY - 3);
+    }
+  });
+  ctx.setLineDash([]);
+  const hopT = spec.hop > 0 ? spec.hop / spec.fs : seconds;
+  tracks.forEach((track, index) => {
+    const color = MODE_COLORS[index % MODE_COLORS.length];
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let drawing = false;
+    let prevT = 0;
+    track.points.forEach((point) => {
+      const t = t0 + point.t;
+      if (drawing && t - prevT > hopT * 3) drawing = false;
+      const x = frame.xOf(xOfT(t));
+      const y = frame.yOf(point.hz);
+      if (!drawing) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+      drawing = true;
+      prevT = t;
+    });
+    ctx.stroke();
+    const last = track.points[track.points.length - 1];
+    if (!last) return;
+    ctx.fillStyle = color;
+    ctx.fillText(last.hz.toFixed(0) + " Hz", frame.xOf(xOfT(t0 + last.t)) + 6, frame.yOf(last.hz) - 4);
+  });
+  if (opt.windowAt && opt.windowAt.length) {
+    ctx.strokeStyle = "#f0b429";
+    ctx.lineWidth = 1.5;
+    opt.windowAt.forEach((t) => {
+      if (!Number.isFinite(t)) return;
+      let x = frame.xOf(xOfT(t));
+      if (x < frame.box.left + 1) x = frame.box.left + 1;
+      if (x > frame.box.right - 1) x = frame.box.right - 1;
+      ctx.beginPath();
+      ctx.moveTo(x, frame.box.top);
+      ctx.lineTo(x, frame.box.bottom);
+      ctx.stroke();
+    });
+  }
+  ctx.restore();
+}
+
+/* --- Analyze: timeline, focus slice, and plot refresh --- */
 
 function channelShow() {
   return {
@@ -823,25 +1155,35 @@ function channelShow() {
   };
 }
 
+/* Scrub + Window pick a time slice; focus recomputes spectrum/metrics for that slice only. */
 function viewWindow() {
   const result = state.result;
   if (!result || !result.count) return null;
   const dur = result.count / result.sampleRate;
   const tFrom = readNum("tFrom");
   const tTo = readNum("tTo");
-  if ((tFrom != null || tTo != null) && dur > 0) {
-    let start = tFrom != null ? tFrom : 0;
-    let end = tTo != null ? tTo : dur;
-    if (start < 0) start = 0;
-    if (end > dur) end = dur;
-    if (!(end > start)) end = Math.min(dur, start + 0.05);
-    return { start, span: end - start, dur, cursor: start };
+  let zoom0 = tFrom != null ? tFrom : 0;
+  let zoom1 = tTo != null ? tTo : dur;
+  if (zoom0 < 0) zoom0 = 0;
+  if (zoom1 > dur) zoom1 = dur;
+  if (!(zoom1 > zoom0)) zoom1 = Math.min(dur, zoom0 + 0.05);
+  const zoomed = (tFrom != null || tTo != null) && zoom1 - zoom0 < dur - 0.001;
+  const picked = Number($("span").value) || 0;
+  const pos = Math.min(1, Math.max(0, Number($("scrub").value) / 1000));
+  if (picked > 0) {
+    const span = Math.min(picked, zoom1 - zoom0);
+    const start = zoom0 + pos * Math.max(0, zoom1 - zoom0 - span);
+    return { start, span, dur, zoom0, zoom1, windowed: true, cursor: start };
   }
-  const span = Number($("span").value) || 0;
-  const maxStart = Math.max(0, dur - span);
-  const pos = Number($("scrub").value) / 1000;
-  const start = span ? pos * maxStart : 0;
-  return { start, span, dur, cursor: span ? start : pos * dur };
+  return {
+    start: zoom0,
+    span: zoomed ? zoom1 - zoom0 : 0,
+    dur,
+    zoom0,
+    zoom1,
+    windowed: false,
+    cursor: zoom0 + pos * (zoom1 - zoom0),
+  };
 }
 
 function refreshView() {
@@ -853,14 +1195,21 @@ function refreshView() {
     return;
   }
   const view = viewWindow();
-  const spanSamples = view.span ? Math.max(16, Math.round(view.span * result.sampleRate)) : result.count;
-  const startSample = Math.round(view.start * result.sampleRate);
-  state.focus = view.span ? VibeDSP.focus(result, startSample, spanSamples) : null;
+  if (view && (view.windowed || view.span)) {
+    const spanSamples = Math.max(16, Math.round(view.span * result.sampleRate));
+    const startSample = Math.round(view.start * result.sampleRate);
+    state.focus = VibeDSP.focus(result, startSample, spanSamples);
+  } else {
+    state.focus = null;
+  }
   const label = $("scrubLabel");
-  if (label) {
-    label.textContent = view.span
-      ? `${view.start.toFixed(2)} to ${Math.min(view.dur, view.start + view.span).toFixed(2)} s`
-      : `Cursor ${view.cursor.toFixed(2)} s`;
+  if (label && view) {
+    const end = Math.min(view.dur, view.start + (view.span || 0));
+    label.textContent = view.windowed
+      ? `${view.start.toFixed(2)} to ${end.toFixed(2)} s`
+      : (view.span
+        ? `${view.zoom0.toFixed(2)} to ${view.zoom1.toFixed(2)} s`
+        : (state.playTimer || Number($("scrub").value) > 0 ? `Cursor ${view.cursor.toFixed(2)} s` : "All"));
   }
   renderMetrics();
   drawAll();
@@ -877,6 +1226,8 @@ function chartScale() {
     grid,
   };
 }
+
+/* --- Live view: polls, conditioning, and sliding time axis --- */
 
 function liveShows() {
   return { x: true, y: true, z: true, rss: $("chRss") ? $("chRss").checked : false };
@@ -902,6 +1253,7 @@ function liveOrder() {
   return 0;
 }
 
+/* Wall clock stretches the time axis forward while new packets arrive (trace scrolls). */
 function liveClockEnd() {
   const dt = state.live && state.live.dt > 0 ? state.live.dt : 0.01;
   const n = state.live && state.live.x ? state.live.x.length : 0;
@@ -931,6 +1283,7 @@ function withEma(series) {
   return VibeDSP.conditionSeries(series, { emaAlpha: alpha });
 }
 
+/* Decay envelope fits raw accel peaks; EMA would flatten the hit and bias damping high. */
 function liveEnvelope(series, fs, t0) {
   if (!$("decayEnv") || !$("decayEnv").checked) return null;
   const raw = state.liveRaw && state.liveRaw.series;
@@ -1054,6 +1407,7 @@ function paintLivePeak() {
     : "No distinct live peak.";
 }
 
+/* liveRawSpec stays un-gated for Q/zeta; liveSpec follows live chart conditioning. */
 function rebuildLiveSpectrum() {
   const packet = state.livePacket;
   if (!packet || !VibeDSP.liveLook || !VibeDSP.liveAccel) return;
@@ -1074,22 +1428,30 @@ function rebuildLiveSpectrum() {
   paintDamp();
 }
 
-function liveSpectrumPeaks(spectrum, show, fMax) {
-  if (!$("markPeaks") || !$("markPeaks").checked || !spectrum || !VibeDSP.topPeaks) return null;
-  const picked = chartMarks.liveSpecCanvas && chartMarks.liveSpecCanvas.selected;
+function spectrumPeaks(spectrum, show, fMin, fMax, canvasId, enabled) {
+  if (!enabled || !spectrum || !VibeDSP.topPeaks) return null;
+  const picked = canvasId && chartMarks[canvasId] && chartMarks[canvasId].selected;
   const peaks = [];
   ["x", "y", "z", "rss"].forEach((key) => {
     if (!show[key] || !spectrum[key]) return;
     if (picked && key !== picked) return;
     const df = spectrum.df || 1;
-    const fMin = Math.max(df, 0.5);
-    const hi = fMax > fMin ? fMax : fMin + 1;
-    VibeDSP.topPeaks(spectrum[key], df, fMin, hi).forEach((peak) => {
+    const lo = Math.max(fMin > 0 ? fMin : 0, df, 0.5);
+    const hi = fMax > lo ? fMax : lo + 1;
+    VibeDSP.topPeaks(spectrum[key], df, lo, hi).forEach((peak) => {
       const i = Math.min(spectrum[key].length - 1, Math.max(0, Math.round(peak.hz / df)));
       peaks.push({ key, hz: i * df, amp: spectrum[key][i], labelHz: peak.hz });
     });
   });
   return peaks;
+}
+
+function analyzePeakMarks(spectrum, show, scale) {
+  const rate = (state.result && state.result.sampleRate) || 1;
+  const autoF = (state.result && (state.result.lowpassHz || rate * 0.45)) || rate * 0.45;
+  const fMax = scale && scale.fMax != null ? scale.fMax : autoF;
+  const fMin = scale && scale.fMin != null ? scale.fMin : 0;
+  return spectrumPeaks(spectrum, show, fMin, fMax, "specCanvas", $("analyzePeaks") && $("analyzePeaks").checked);
 }
 
 function tailSeries(series, fs, t0, span) {
@@ -1104,6 +1466,7 @@ function tailSeries(series, fs, t0, span) {
   };
 }
 
+/* Keep Live Signal and Analyze View on the same quantity; clear manual Y limits when switching. */
 function syncSignal(source) {
   const fromLive = source === "live";
   const qty = fromLive ? liveQuantity() : ($("quantity") ? $("quantity").value : "accel");
@@ -1119,6 +1482,7 @@ function syncSignal(source) {
   if (liveQuantity() === "accel" && state.status) applyStatus(state.status);
 }
 
+/* Accel uses /api/live packets when available; velocity/displacement integrate in the browser. */
 function drawLiveWave() {
   const live = $("liveCanvas");
   if (!live || !document.getElementById("live").classList.contains("active")) return;
@@ -1161,6 +1525,7 @@ function drawLiveWave() {
     { key: env.key, values: env.pos, color: "#f0b429", dash: [6, 5] },
     { key: env.key, values: env.neg, color: "#f0b429", dash: [6, 5] },
   ] : null;
+  const shownEnd = t0 + (series && series.x && series.x.length > 1 ? (series.x.length - 1) / fs : 1);
   drawWave(live, series, fs, liveShows(), {
     title: "Live " + quantityLabel(qty).toLowerCase(),
     yTitle: quantityLabel(qty) + " (" + unitName(qty) + ")",
@@ -1169,6 +1534,15 @@ function drawLiveWave() {
     grid: true,
     t0,
     guides,
+    edges: { xMin: true },
+    axis(edge, raw) {
+      if (edge !== "xMin") return;
+      if (raw === "") setLimit("liveSpan", "0");
+      else {
+        const span = shownEnd - Number(raw);
+        if (span > 0.05) setLimit("liveSpan", String(Math.round(span * 1000) / 1000));
+      }
+    },
   });
   chartRedraw.liveCanvas = () => drawLiveWave();
   paintDamp();
@@ -1196,22 +1570,21 @@ function drawLiveSpectrum() {
     logF,
     curve: true,
     grid: true,
-    autoPeaks: liveSpectrumPeaks(spec, show, fMax),
+    autoPeaks: spectrumPeaks(spec, show, fLo != null ? fLo : 0, fMax, "liveSpecCanvas", $("markPeaks") && $("markPeaks").checked),
+    edges: { xMin: true, xMax: true },
+    axis: limitAxis({ xMin: "liveFmin", xMax: "liveFmax" }),
   });
   chartRedraw.liveSpecCanvas = () => drawLiveSpectrum();
 }
 
-function gramSeries(series) {
+/* Spectrogram uses pre-gate accel so a noise gate does not erase stripes. */
+function gramSeries(series, sampleStart, sampleCount) {
   const full = state.result;
-  if (!full || full.quantity !== "accel" || !full.beforeGate || !full.beforeGate.x) return series;
-  const src = full.beforeGate;
-  let a = 0;
-  let len = src.x.length;
-  if (state.focus && state.focus.count > 0) {
-    a = Math.max(0, state.focus.start | 0);
-    len = state.focus.count | 0;
-    if (a + len > src.x.length) len = src.x.length - a;
-  }
+  const src = (full && full.quantity === "accel" && full.beforeGate && full.beforeGate.x) ? full.beforeGate : series;
+  if (!src || !src.x) return series;
+  const a = Math.max(0, sampleStart || 0);
+  let len = sampleCount > 0 ? sampleCount : src.x.length - a;
+  if (a + len > src.x.length) len = src.x.length - a;
   if (len < 1) return series;
   if (a === 0 && len === src.x.length) return src;
   return {
@@ -1221,13 +1594,18 @@ function gramSeries(series) {
   };
 }
 
-function spectrogramSeries(series) {
-  const use = gramSeries(series);
+function spectrogramSeries(series, sampleStart, sampleCount) {
+  const use = gramSeries(series, sampleStart, sampleCount);
   if (!use || !use.x || use.x.length < 64 || !state.result) return null;
+  const win = Number($("stftWin") && $("stftWin").value) || 256;
+  const key = [state.result.count, state.result.quantity, sampleStart || 0, use.x.length, win].join(":");
+  if (state.gramCache && state.gramKey === key) return state.gramCache;
   const rss = new Float32Array(use.x.length);
   for (let i = 0; i < rss.length; i++) rss[i] = Math.hypot(use.x[i] || 0, use.y[i] || 0, use.z[i] || 0);
-  const win = Number($("stftWin") && $("stftWin").value) || 256;
-  return VibeDSP.spectrogram(rss, state.result.sampleRate, { win });
+  const picture = VibeDSP.spectrogram(rss, state.result.sampleRate, { win });
+  state.gramKey = key;
+  state.gramCache = picture;
+  return picture;
 }
 
 function drawAll() {
@@ -1237,29 +1615,55 @@ function drawAll() {
   }
   if (!document.getElementById("analyze").classList.contains("active")) return;
   const view = viewWindow();
-  const focused = state.focus;
-  const series = focused ? focused.series : selectedSeries();
-  const spectrum = focused ? focused.spectrum : (state.result && state.result.spectrum);
-  const raw = focused ? focused.raw : (state.result && state.result.raw);
+  const fs = state.result ? state.result.sampleRate : 1;
+  const full = selectedSeries();
+  const rawFull = state.result && state.result.raw;
+  let wave = full;
+  let raw = rawFull;
+  let t0 = 0;
+  let sampleStart = 0;
+  let sampleCount = full && full.x ? full.x.length : 0;
+  if (view && full && full.x && fs > 0) {
+    const a = Math.max(0, Math.min(full.x.length, Math.round(view.zoom0 * fs)));
+    const b = Math.max(a, Math.min(full.x.length, Math.round(view.zoom1 * fs)));
+    sampleStart = a;
+    sampleCount = b - a;
+    if (a > 0 || b < full.x.length) {
+      const cut = (series) => series && series.x ? {
+        x: series.x.subarray(a, b),
+        y: series.y ? series.y.subarray(a, b) : series.y,
+        z: series.z ? series.z.subarray(a, b) : series.z,
+      } : series;
+      wave = cut(full);
+      raw = cut(rawFull);
+      t0 = view.zoom0;
+    }
+  }
+  const spectrum = state.focus ? state.focus.spectrum : (state.result && state.result.spectrum);
+  const windowAt = view && view.windowed ? [view.start, Math.min(view.dur, view.start + view.span)] : null;
+  const cursor = view && !view.windowed && (state.playTimer || Number($("scrub").value) > 0) ? view.cursor : null;
   const scale = chartScale();
   const quantity = state.result && state.result.quantity;
   const unit = unitName(quantity);
   const gain = displayScale(quantity);
   const logF = $("logF") && $("logF").checked;
   const show = channelShow();
-  drawWave($("waveCanvas"), series, state.result ? state.result.sampleRate : 1, show, {
+  drawWave($("waveCanvas"), wave, fs, show, {
     under: raw,
-    cursor: view && view.cursor,
-    span: view ? view.span : 0,
-    t0: view && view.span ? view.start : 0,
+    cursor,
+    windowAt,
+    t0,
     title: quantityLabel(quantity) + " waveform",
     yTitle: quantityLabel(quantity) + " (" + unit + ")",
     yMin: scale.yMin,
     yMax: scale.yMax,
     gain,
     grid: scale.grid,
+    edges: { xMin: true, xMax: true, yMin: true, yMax: true },
+    axis: limitAxis({ xMin: "tFrom", xMax: "tTo", yMin: "yMin", yMax: "yMax" }),
   });
-  drawSpectrum($("specCanvas"), spectrum, $("logSpec").checked, show, {
+  const logAmp = $("logSpec").checked;
+  drawSpectrum($("specCanvas"), spectrum, logAmp, show, {
     title: quantityLabel(quantity) + " spectrum",
     yTitle: "Amplitude (" + unit + ")",
     fMin: scale.fMin,
@@ -1268,18 +1672,58 @@ function drawAll() {
     gain,
     logF,
     grid: scale.grid,
+    autoPeaks: analyzePeakMarks(spectrum, show, scale),
+    edges: { xMin: true, xMax: true, yMax: !logAmp },
+    axis: limitAxis({ xMin: "fMin", xMax: "fMax", yMax: "specMax" }),
   });
   const gram = $("gramCanvas");
+  const picture = full ? spectrogramSeries(full, sampleStart, sampleCount) : null;
   if (gram) {
-    const picture = series ? spectrogramSeries(series) : null;
     drawSpectrogram(gram, picture, {
       title: "Spectrogram, RSS",
-      t0: view && view.span ? view.start : 0,
+      t0,
+      windowAt,
       fMin: scale.fMin,
       fMax: scale.fMax,
       logF,
       grid: scale.grid,
       empty: "Open a capture to see how the tones decay",
+      edges: { xMin: true, xMax: true, yMin: true, yMax: true },
+      axis: limitAxis({ xMin: "tFrom", xMax: "tTo", yMin: "fMin", yMax: "fMax" }),
+    });
+  }
+  const camp = $("campCanvas");
+  if (camp) {
+    drawCampbell(camp, picture, {
+      t0,
+      windowAt,
+      fMin: scale.fMin,
+      fMax: scale.fMax,
+      logF,
+      grid: scale.grid,
+      edges: { xMin: true, xMax: true, yMin: true, yMax: true, xTitle: true },
+      axis(edge, raw) {
+        if (edge === "xTitle") {
+          const rpm0 = readNum("rpmFrom");
+          const rpm1 = readNum("rpmTo");
+          const runUp = rpm0 != null && rpm1 != null && Math.abs(rpm1 - rpm0) > 0.5;
+          if (runUp) {
+            setLimit("rpmFrom", "");
+            setLimit("rpmTo", "");
+          } else {
+            setLimit("rpmFrom", "0");
+            setLimit("rpmTo", "3000");
+          }
+          return;
+        }
+        const rpm0 = readNum("rpmFrom");
+        const rpm1 = readNum("rpmTo");
+        const runUp = rpm0 != null && rpm1 != null && Math.abs(rpm1 - rpm0) > 0.5;
+        const map = runUp
+          ? { xMin: "rpmFrom", xMax: "rpmTo", yMin: "fMin", yMax: "fMax" }
+          : { xMin: "tFrom", xMax: "tTo", yMin: "fMin", yMax: "fMax" };
+        if (map[edge]) setLimit(map[edge], raw);
+      },
     });
   }
 }
@@ -1318,7 +1762,7 @@ function renderMetrics() {
   notes.innerHTML = "";
   peaks.innerHTML = "";
   if (!result || !result.metrics) {
-    box.innerHTML = "<p>Start a capture, or open a .vibe file.</p>";
+    box.innerHTML = "<p>Press Start on Live, open a save from the Stick list, or drop a .vibe file.</p>";
     return;
   }
   const rows = (title, block, digits) => {
@@ -1370,7 +1814,12 @@ function renderMetrics() {
   } else peaks.textContent = "No distinct peaks.";
   const resBox = $("resonance");
   if (resonance) {
-    resBox.innerHTML = `Natural frequency <strong>${fmt(resonance.hz, 2)} Hz</strong>. Half-power bandwidth ${fmt(resonance.bandwidthHz, 2)} Hz. Damping ratio ${fmt(resonance.damping, 3)}. Q ${fmt(resonance.q, 1)}.`;
+    resBox.innerHTML = [
+      `Natural frequency <strong>${fmt(resonance.hz, 2)} Hz</strong>`,
+      `Half-power bandwidth ${fmt(resonance.bandwidthHz, 2)} Hz`,
+      `Damping ratio ${fmt(resonance.damping, 3)}`,
+      `Q ${fmt(resonance.q, 1)}`,
+    ].map((line) => `<div>${line}</div>`).join("");
   } else resBox.textContent = "";
   renderBaseline(resonance, accelBlock);
   (result.notes || []).forEach((note) => {
@@ -1394,6 +1843,8 @@ function renderBaseline(resonance, accel) {
   if (accel && base.rss) lines.push(`RSS change ${fmt(100 * (accel.rss - base.rss) / base.rss, 1)}%.`);
   el.textContent = lines.join(" ");
 }
+
+/* --- Captures: load, CSV import, and VibeDSP analyze --- */
 
 function runAnalysis() {
   if (!state.parsed) return;
@@ -1519,6 +1970,7 @@ function paintRecBar(s) {
   }
 }
 
+/* Status poll drives chrome, recording flow, and first-time form sync from the Stick. */
 function applyStatus(s) {
   state.status = s;
   const ended = state.wasRecording && !s.recording && s.captureReady;
@@ -1557,12 +2009,16 @@ function applyStatus(s) {
   btn.disabled = state.busy || !s.imu;
   const pct = s.target ? Math.min(100, (100 * s.samples) / s.target) : 0;
   paintRecBar(s);
-  $("capMeta").textContent = s.recording
-    ? `Recording ${ (s.elapsedMs / 1000).toFixed(1) } s · ${s.samples} samples · ${pct.toFixed(0)}%. Do not touch the Stick.`
-    : `Ready at ${s.sampleRate} Hz, ±${s.rangeG} g. Up to ${Math.floor(s.capacity / s.sampleRate)} s fits in memory.`;
-  $("netInfo").textContent = `Onboard network ${s.apSsid} / ${s.apPass} at ${s.apIp}` +
-    (s.staConnected ? `. Joined ${s.staSsid} at ${s.staIp}.` : s.staSsid ? `. Trying to join ${s.staSsid}.` : ".") +
-    " USB serial and Bluetooth Tremble use the same commands.";
+  if ($("capMeta")) {
+    $("capMeta").textContent = s.recording
+      ? `Recording ${ (s.elapsedMs / 1000).toFixed(1) } s · ${s.samples} samples · ${pct.toFixed(0)}%. Do not touch the Stick.`
+      : `Ready at ${s.sampleRate} Hz, ±${s.rangeG} g. Up to ${Math.floor(s.capacity / s.sampleRate)} s fits in memory.`;
+  }
+  if ($("netInfo")) {
+    $("netInfo").textContent = `Onboard network ${s.apSsid} / ${s.apPass} at ${s.apIp}` +
+      (s.staConnected ? `. Joined ${s.staSsid} at ${s.staIp}.` : s.staSsid ? `. Trying to join ${s.staSsid}.` : ".") +
+      " USB serial and Bluetooth Tremble use the same commands.";
+  }
   $("gyroLive").textContent = s.gyro
     ? `Gyro X ${fmt(s.gyroRms[0], 2)} dps\nGyro Y ${fmt(s.gyroRms[1], 2)} dps\nGyro Z ${fmt(s.gyroRms[2], 2)} dps`
     : "";
@@ -1582,15 +2038,21 @@ function applyStatus(s) {
     state.ssidSeen = true;
   }
   if ($("calStart")) $("calStart").disabled = state.busy || s.recording || !s.imu;
+  syncApplyBtn();
   renderNoise();
   if (s.recording) banner("");
   else if (ended && state.calibrating) finishCalibration();
   else if (ended) {
-    banner("Capture finished. Open Analyze, or stay here and start another.", true);
-    loadLatest();
+    banner("Capture finished. Opening Analyze…", true);
+    loadLatest()
+      .then(() => showTab("analyze"))
+      .catch((err) => banner(stickDown(err) || "Capture finished, but Analyze could not load it.", false));
   }
 }
 
+/* --- Stick HTTP: status, live samples, and SoftAP pacing --- */
+
+/* One in-flight Stick request at a time (state.netBusy) so polls do not pile up on SoftAP. */
 function fetchStick(url, ms) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), ms);
@@ -1601,6 +2063,7 @@ function linkOk() {
   state.linkMisses = 0;
 }
 
+/* After several timeouts, stop hammering live polls and show a lost-link message. */
 function linkFail() {
   state.linkMisses += 1;
   if (state.linkMisses < 6) return;
@@ -1612,7 +2075,7 @@ async function pollStatus() {
   if (state.netBusy) return;
   state.netBusy = true;
   try {
-    const res = await fetchStick("/api/status", 4000);
+    const res = await fetchStick("/api/status", softApOnly() || stickLinkDown() ? 8000 : 4000);
     if (!res.ok) throw new Error("status");
     linkOk();
     applyStatus(await res.json());
@@ -1628,22 +2091,76 @@ function parseLive(buf) {
   const view = new DataView(buf);
   const dt = view.getFloat32(0, true);
   const count = view.getUint16(4, true);
-  if (count < 2 || buf.byteLength < 8 + count * 12) return null;
+  if (count < 2) return null;
   const x = new Float32Array(count);
   const y = new Float32Array(count);
   const z = new Float32Array(count);
   let offset = 8;
-  for (let i = 0; i < count; i++) {
-    x[i] = view.getFloat32(offset, true);
-    y[i] = view.getFloat32(offset + 4, true);
-    z[i] = view.getFloat32(offset + 8, true);
-    offset += 12;
+  // New packets use int16 milli-g (6 bytes/sample). Old firmware sent floats.
+  if (buf.byteLength >= 8 + count * 6 && buf.byteLength < 8 + count * 12) {
+    for (let i = 0; i < count; i++) {
+      x[i] = view.getInt16(offset, true) / 1000;
+      y[i] = view.getInt16(offset + 2, true) / 1000;
+      z[i] = view.getInt16(offset + 4, true) / 1000;
+      offset += 6;
+    }
+  } else if (buf.byteLength >= 8 + count * 12) {
+    for (let i = 0; i < count; i++) {
+      x[i] = view.getFloat32(offset, true);
+      y[i] = view.getFloat32(offset + 4, true);
+      z[i] = view.getFloat32(offset + 8, true);
+      offset += 12;
+    }
+  } else {
+    return null;
   }
   return { dt, x, y, z };
 }
 
+function pageVisible() {
+  return document.visibilityState !== "hidden";
+}
+
+/* True when the page should use the lighter livefft-only path (hotspot or AP-only Stick). */
+function softApOnly() {
+  const host = (location.hostname || "").toLowerCase();
+  const s = state.status;
+  // Hit the SoftAP IP directly: keep the light feed.
+  if (host === "192.168.4.1") return true;
+  if (s && s.apIp && host === s.apIp) return true;
+  // Lab STA address: full feed is fine.
+  if (s && s.staIp && host === s.staIp) return false;
+  if (s && s.staConnected && !s.apOn) return false;
+  // SoftAP-only Stick (no lab join yet), including tremble.local on the hotspot.
+  if (s && s.apOn && !s.staConnected) return true;
+  // AP+STA via tremble.local usually means lab mDNS. Do not throttle that path.
+  return false;
+}
+
+function stickLinkDown() {
+  return state.linkMisses >= 3;
+}
+
+/* On SoftAP, waveform samples are derived from the livefft tail (no separate /api/live). */
+function liveFromSpectrum(samples, count, rate) {
+  const n = Math.min(count, 300);
+  const start = (count - n) * 3;
+  const x = new Float32Array(n);
+  const y = new Float32Array(n);
+  const z = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const o = start + i * 3;
+    x[i] = samples[o] / 1000;
+    y[i] = samples[o + 1] / 1000;
+    z[i] = samples[o + 2] / 1000;
+  }
+  return { dt: rate > 0 ? 1 / rate : 0.001, x, y, z };
+}
+
 async function pollLive() {
-  if (state.paused || state.netBusy) return;
+  if (state.paused || state.netBusy || !pageVisible() || stickLinkDown()) return;
+  // SoftAP gets one feed via /api/livefft so the hotspot is not double-hit.
+  if (softApOnly()) return;
   if (!$("live").classList.contains("active") && !state.recording) return;
   state.netBusy = true;
   try {
@@ -1662,20 +2179,56 @@ async function pollLive() {
   }
 }
 
-async function applySettings() {
-  await post("/api/settings", {
-    rate: $("rate").value,
-    range: $("range").value,
-    seconds: $("seconds").value || "0",
-    gyro: $("gyro").checked ? "1" : "0",
-  });
+function formCaptureSettings() {
+  return {
+    rate: String($("rate").value),
+    range: String($("range").value),
+    seconds: String($("seconds").value || "0"),
+    gyro: !!$("gyro").checked,
+  };
 }
 
+function settingsDirty() {
+  const s = state.status;
+  if (!s) return true;
+  const form = formCaptureSettings();
+  return form.rate !== String(s.sampleRate)
+    || form.range !== String(s.rangeG)
+    || form.seconds !== String(s.durationSec)
+    || form.gyro !== !!s.gyro;
+}
+
+function syncApplyBtn() {
+  const btn = $("apply");
+  if (!btn) return;
+  btn.disabled = !settingsDirty() || !!state.recording || !!state.busy;
+}
+
+async function applySettings() {
+  const form = formCaptureSettings();
+  await post("/api/settings", {
+    rate: form.rate,
+    range: form.range,
+    seconds: form.seconds,
+    gyro: form.gyro ? "1" : "0",
+  });
+  if (state.status) {
+    state.status.sampleRate = Number(form.rate);
+    state.status.rangeG = Number(form.range);
+    state.status.durationSec = Number(form.seconds);
+    state.status.gyro = form.gyro;
+  }
+  syncApplyBtn();
+}
+
+/* livefft returns int16 milli-g blocks; firmware also supplies rate and lsb for VibeDSP.liveLook. */
 async function pollSpectrum() {
-  if (state.paused || state.netBusy || !$("live").classList.contains("active")) return;
+  if (state.paused || state.netBusy || !pageVisible() || stickLinkDown()) return;
+  if (!$("live").classList.contains("active")) return;
   state.netBusy = true;
   try {
-    const res = await fetchStick("/api/livefft", 3000);
+    const soft = softApOnly();
+    const res = await fetchStick("/api/livefft", soft ? 8000 : 3000);
     if (!res.ok) throw new Error("spectrum");
     const buf = await res.arrayBuffer();
     if (buf.byteLength < 18) return;
@@ -1685,14 +2238,19 @@ async function pollSpectrum() {
     const count = view.getUint16(8, true);
     if (count < 32 || buf.byteLength < 12 + count * 6) return;
     const want = Number($("fftWin") && $("fftWin").value) || count;
-    const use = Math.max(32, Math.min(count, want));
+    const use = Math.max(32, Math.min(count, soft ? Math.min(want, 256) : want));
     const samples = new Int16Array(buf, 12 + (count - use) * 6, use * 3);
-    state.livePacket = { samples: Int16Array.from(samples), count: use, lsb, rate };
+    const copy = Int16Array.from(samples);
+    state.livePacket = { samples: copy, count: use, lsb, rate };
+    if (soft) {
+      state.live = liveFromSpectrum(copy, use, rate);
+      state.liveAt = performance.now();
+    }
     linkOk();
     rebuildLiveSpectrum();
     if ($("live").classList.contains("active")) {
       drawLiveSpectrum();
-      if (liveOrder() !== 0) drawLiveWave();
+      if (soft || liveOrder() !== 0) drawLiveWave();
     }
   } catch (err) {
     linkFail();
@@ -1702,17 +2260,31 @@ async function pollSpectrum() {
 }
 
 function feedPace() {
-  const mode = ($("feedRate") && $("feedRate").value) || "steady";
-  if (mode === "fast") return { live: 300, spec: 1000, status: 3000, idle: 1500 };
-  if (mode === "slow") return { live: 1200, spec: 3500, status: 5000, idle: 2500 };
-  return { live: 700, spec: 2000, status: 4000, idle: 2000 };
+  const mode = ($("feedRate") && $("feedRate").value) || "slow";
+  // SoftAP on the StickS3 falls over if the page hammers /api/live.
+  let pace;
+  if (mode === "fast") pace = { live: 500, spec: 1500, status: 5000, idle: 2000 };
+  else if (mode === "slow") pace = { live: 1500, spec: 4500, status: 10000, idle: 3500 };
+  else pace = { live: 1000, spec: 3000, status: 8000, idle: 3000 };
+  if (softApOnly()) {
+    // SoftAP can take a modest update rate now that only livefft runs.
+    return {
+      live: Math.max(pace.live, 2000),
+      spec: Math.max(pace.spec, 2500),
+      status: Math.max(pace.status, 6000),
+      idle: Math.max(pace.idle, 4000),
+    };
+  }
+  return pace;
 }
 
+/* Self-scheduling poll loop: skips live work when tab hidden unless recording. */
 function pace(fn, pickMs) {
   const tick = async () => {
-    const hot = document.getElementById("live").classList.contains("active");
+    const visible = pageVisible();
+    const hot = visible && document.getElementById("live").classList.contains("active");
     const started = performance.now();
-    const recording = state.recording && fn !== pollStatus;
+    const recording = visible && state.recording && fn !== pollStatus;
     if (fn === pollStatus || hot || recording) {
       try { await fn(); } catch (err) { /* the poll itself reports a miss */ }
     }
@@ -1847,8 +2419,15 @@ async function toggleRecord() {
   $("recBtn").disabled = true;
   try {
     if (!state.recording) {
-      await applySettings();
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      const s = state.status;
+      const same = s && String(s.sampleRate) === String($("rate").value)
+        && String(s.rangeG) === String($("range").value)
+        && String(s.durationSec) === String($("seconds").value || "0")
+        && !!s.gyro === !!$("gyro").checked;
+      if (!same) {
+        await applySettings();
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
       await post("/api/record", { action: "start" });
       banner("Recording. Leave the Stick alone until this finishes.", false);
     } else {
@@ -1856,9 +2435,10 @@ async function toggleRecord() {
     }
     await pollStatus();
   } catch (err) {
-    banner(err.message, false);
+    banner(stickDown(err) || "Could not start the recording.", false);
   } finally {
     state.busy = false;
+    syncApplyBtn();
   }
 }
 
@@ -1870,12 +2450,53 @@ function usePreset(name) {
   $("hp").value = preset.hp;
   $("lp").value = preset.lp;
   saveUi();
+  syncApplyBtn();
   if (state.parsed) runAnalysis();
 }
 
+function stickDown(err) {
+  const msg = err && err.message ? err.message : "";
+  if (!msg || err.name === "TypeError" || msg === "Failed to fetch" || msg === "Load failed") {
+    return "The Stick did not answer. Check the list in a moment.";
+  }
+  return msg;
+}
+
+function selectedFileNames() {
+  return [...document.querySelectorAll("#fileList .file-pick input:checked")].map((box) => box.value);
+}
+
+function syncFileTools() {
+  const boxes = [...document.querySelectorAll("#fileList .file-pick input")];
+  const picked = boxes.filter((box) => box.checked).length;
+  boxes.forEach((box) => { box.disabled = state.fileBusy; });
+  document.querySelectorAll("#fileList button").forEach((btn) => { btn.disabled = state.fileBusy; });
+  const del = $("fileDelete");
+  if (del) del.disabled = state.fileBusy || picked === 0;
+  const all = $("fileAll");
+  if (all) {
+    all.checked = boxes.length > 0 && picked === boxes.length;
+    all.disabled = state.fileBusy || boxes.length === 0;
+  }
+  if ($("analyzeSave")) $("analyzeSave").disabled = state.fileBusy;
+}
+
+/* --- Stick file list (ETag avoids rebuilding the DOM when nothing changed) --- */
+
 async function refreshFiles() {
-  const res = await fetch("/api/files");
-  if (!res.ok) return;
+  const headers = {};
+  if (state.filesEtag) headers["If-None-Match"] = state.filesEtag;
+  const res = await fetch("/api/files", { headers, cache: "no-store" });
+  if (res.status === 304) {
+    syncFileTools();
+    return;
+  }
+  if (!res.ok) {
+    syncFileTools();
+    return;
+  }
+  const etag = res.headers.get("ETag");
+  if (etag) state.filesEtag = etag;
   const data = await res.json();
   const pct = data.total ? (100 * data.used) / data.total : 0;
   $("usedBar").style.width = pct.toFixed(1) + "%";
@@ -1884,36 +2505,86 @@ async function refreshFiles() {
   list.innerHTML = "";
   if (!data.files.length) {
     list.innerHTML = "<li>No files saved on the Stick yet.</li>";
+    syncFileTools();
     return;
   }
   data.files.forEach((file) => {
     const li = document.createElement("li");
+    const pick = document.createElement("label");
+    pick.className = "check file-pick";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.value = file.name;
+    box.addEventListener("change", syncFileTools);
     const name = document.createElement("span");
     name.textContent = `${file.name}.vibe · ${(file.bytes / 1024).toFixed(0)} KB`;
+    pick.append(box, name);
     const actions = document.createElement("span");
+    actions.className = "file-actions";
     const open = document.createElement("button");
     open.className = "ghost";
     open.type = "button";
     open.textContent = "Open";
     open.addEventListener("click", async () => {
-      const response = await fetch("/api/files/get?name=" + encodeURIComponent(file.name));
-      if (!response.ok) return;
-      await loadBuffer(await response.arrayBuffer(), file.name + ".vibe");
-      showTab("analyze");
+      if (state.fileBusy) return;
+      try {
+        const response = await fetch("/api/files/get?name=" + encodeURIComponent(file.name), { cache: "no-store" });
+        const bytes = await response.arrayBuffer();
+        if (!response.ok) {
+          let detail = "";
+          try { detail = JSON.parse(new TextDecoder().decode(bytes)).error || ""; } catch (err) { /* binary or empty */ }
+          throw new Error(detail || ("Could not open that file (" + response.status + ")"));
+        }
+        if (bytes.byteLength < 64) {
+          throw new Error("That capture came back empty. Flash the Stick and try Open again.");
+        }
+        const head = new Uint8Array(bytes, 0, 4);
+        const magic = String.fromCharCode(head[0], head[1], head[2], head[3]);
+        if (magic !== "VIBE") throw new Error("That file is not a Tremble capture");
+        await loadBuffer(bytes, file.name + ".vibe");
+        showTab("analyze");
+      } catch (err) {
+        banner(stickDown(err) || "Could not open that file", false);
+      }
     });
     const del = document.createElement("button");
     del.className = "ghost";
     del.type = "button";
     del.textContent = "Delete";
-    del.addEventListener("click", async () => {
-      if (!confirm("Delete " + file.name + "?")) return;
-      await post("/api/files/delete", { name: file.name });
-      refreshFiles();
-    });
+    del.addEventListener("click", () => deleteCaptures([file.name]));
     actions.append(open, del);
-    li.append(name, actions);
+    li.append(pick, actions);
     list.appendChild(li);
   });
+  syncFileTools();
+}
+
+async function deleteCaptures(names) {
+  const unique = [...new Set(names.filter(Boolean))];
+  if (!unique.length || state.fileBusy) return;
+  const label = unique.length === 1 ? unique[0] : unique.length + " files";
+  if (!confirm("Delete " + label + "?")) return;
+  state.fileBusy = true;
+  syncFileTools();
+  banner("Deleting " + label + "…", false);
+  try {
+    const body = new URLSearchParams();
+    unique.forEach((name) => body.append("name", name));
+    const res = await fetch("/api/files/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) throw new Error(data.error || "Could not delete");
+    state.filesEtag = "";
+    banner(unique.length === 1 ? "Deleted " + unique[0] + "." : "Deleted " + unique.length + " files.", true);
+  } catch (err) {
+    banner(stickDown(err), false);
+  } finally {
+    state.fileBusy = false;
+    try { await refreshFiles(); } catch (err) { syncFileTools(); }
+  }
 }
 
 function downloadBlob(blob, name) {
@@ -1928,6 +2599,8 @@ function downloadBlob(blob, name) {
 function stamp() {
   return new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
 }
+
+/* --- Browser-side exports (no server round trip beyond opening captures) --- */
 
 function exportCsv() {
   const result = state.result;
@@ -2036,6 +2709,328 @@ function exportFea() {
   downloadBlob(new Blob(chunks, { type: "text/csv" }), `tremble-fea-${stamp()}.csv`);
 }
 
+let crcTable = null;
+
+function crc32(data) {
+  if (!crcTable) {
+    crcTable = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      crcTable[n] = c >>> 0;
+    }
+  }
+  let c = 0xffffffff;
+  for (let i = 0; i < data.length; i++) c = crcTable[(c ^ data[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+/* Minimal ZIP store for Word report packaging (DOCX is OPC zip). */
+function zipStore(files) {
+  const enc = new TextEncoder();
+  const locals = [];
+  const central = [];
+  let offset = 0;
+  files.forEach((file) => {
+    const name = enc.encode(file.name);
+    const data = file.data;
+    const crc = crc32(data);
+    const local = new Uint8Array(30 + name.length);
+    const view = new DataView(local.buffer);
+    view.setUint32(0, 0x04034b50, true);
+    view.setUint16(4, 20, true);
+    view.setUint16(8, 0, true);
+    view.setUint32(14, crc, true);
+    view.setUint32(18, data.length, true);
+    view.setUint32(22, data.length, true);
+    view.setUint16(26, name.length, true);
+    local.set(name, 30);
+    locals.push(local, data);
+    const head = new Uint8Array(46 + name.length);
+    const dir = new DataView(head.buffer);
+    dir.setUint32(0, 0x02014b50, true);
+    dir.setUint16(4, 20, true);
+    dir.setUint16(6, 20, true);
+    dir.setUint32(16, crc, true);
+    dir.setUint32(20, data.length, true);
+    dir.setUint32(24, data.length, true);
+    dir.setUint16(28, name.length, true);
+    dir.setUint32(42, offset, true);
+    head.set(name, 46);
+    central.push(head);
+    offset += local.length + data.length;
+  });
+  const dirBytes = central.reduce((sum, part) => sum + part.length, 0);
+  const end = new Uint8Array(22);
+  const tail = new DataView(end.buffer);
+  tail.setUint32(0, 0x06054b50, true);
+  tail.setUint16(8, files.length, true);
+  tail.setUint16(10, files.length, true);
+  tail.setUint32(12, dirBytes, true);
+  tail.setUint32(16, offset, true);
+  return new Blob([...locals, ...central, end], {
+    type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  });
+}
+
+function xmlEscape(text) {
+  return String(text == null ? "" : text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function docParagraph(text, opts) {
+  const style = opts || {};
+  const bold = style.bold ? "<w:b/>" : "";
+  const size = style.size ? `<w:sz w:val="${style.size}"/><w:szCs w:val="${style.size}"/>` : "";
+  const color = style.color ? `<w:color w:val="${style.color}"/>` : "";
+  return `<w:p><w:r><w:rPr>${bold}${size}${color}</w:rPr><w:t xml:space="preserve">${xmlEscape(text)}</w:t></w:r></w:p>`;
+}
+
+function docTable(rows) {
+  const border = (edge) => `<w:${edge} w:val="single" w:sz="4" w:space="0" w:color="C5CED8"/>`;
+  const borders = `<w:tblBorders>${border("top")}${border("left")}${border("bottom")}${border("right")}${border("insideH")}${border("insideV")}</w:tblBorders>`;
+  const body = rows.map((row, index) => {
+    const cells = row.map((cell) => {
+      const bold = index === 0 ? "<w:b/>" : "";
+      return `<w:tc><w:p><w:r><w:rPr>${bold}<w:sz w:val="20"/></w:rPr><w:t xml:space="preserve">${xmlEscape(cell)}</w:t></w:r></w:p></w:tc>`;
+    }).join("");
+    return `<w:tr>${cells}</w:tr>`;
+  }).join("");
+  return `<w:tbl><w:tblPr><w:tblW w:w="5000" w:type="pct"/>${borders}</w:tblPr>${body}</w:tbl>`;
+}
+
+function docImage(relId, name, cx, cy, docId) {
+  return `<w:p><w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0">
+    <wp:extent cx="${cx}" cy="${cy}"/>
+    <wp:effectExtent l="0" t="0" r="0" b="0"/>
+    <wp:docPr id="${docId}" name="${xmlEscape(name)}"/>
+    <wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>
+    <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic>
+      <pic:nvPicPr><pic:cNvPr id="${docId}" name="${xmlEscape(name)}"/><pic:cNvPicPr/></pic:nvPicPr>
+      <pic:blipFill><a:blip r:embed="${relId}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>
+      <pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>
+    </pic:pic></a:graphicData></a:graphic>
+  </wp:inline></w:drawing></w:r></w:p>`;
+}
+
+function scaledMetric(block, quantity) {
+  if (!block || !Number.isFinite(block.rss)) return null;
+  const k = displayScale(quantity);
+  if (k === 1) return block;
+  const one = (item) => item && {
+    rms: item.rms * k,
+    peak: item.peak * k,
+    peakToPeak: item.peakToPeak * k,
+    crest: item.crest,
+  };
+  return { x: one(block.x), y: one(block.y), z: one(block.z), rss: block.rss * k };
+}
+
+function metricRows(block, digits) {
+  const cell = (item, key) => (item ? fmt(item[key], key === "crest" ? 2 : digits) : "");
+  const line = (name, item) => [name, cell(item, "rms"), cell(item, "peak"), cell(item, "peakToPeak"), cell(item, "crest")];
+  return [
+    ["", "RMS", "Peak", "Pk-Pk", "Crest"],
+    line("X", block.x),
+    line("Y", block.y),
+    line("Z", block.z),
+    ["RSS", fmt(block.rss, digits), "", "", ""],
+  ];
+}
+
+async function chartPng(draw, width, height) {
+  const fake = document.createElement("canvas");
+  fake.style.width = width + "px";
+  fake.style.height = height + "px";
+  fake.style.position = "fixed";
+  fake.style.left = "-4000px";
+  document.body.appendChild(fake);
+  draw(fake);
+  const blob = await new Promise((resolve) => fake.toBlob(resolve, "image/png"));
+  fake.remove();
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
+async function exportDocx() {
+  const result = state.result;
+  const series = selectedSeries();
+  if (!result || !series || !result.spectrum) {
+    banner("Open a capture before writing the report.", false);
+    return;
+  }
+  const view = viewWindow();
+  const scale = chartScale();
+  const unit = unitName();
+  const show = channelShow();
+  const quantity = result.quantity || "accel";
+  const when = state.parsed && state.parsed.epoch
+    ? new Date(state.parsed.epoch * 1000).toISOString()
+    : new Date().toISOString();
+  const seconds = result.sampleRate > 0 ? result.count / result.sampleRate : 0;
+  const parts = [];
+  parts.push(docParagraph("Tremble", { bold: true, size: 36, color: "142033" }));
+  parts.push(docParagraph("Vibration report", { size: 28, color: "415066" }));
+  parts.push(docParagraph(when, { size: 20, color: "66788C" }));
+  if (state.source) parts.push(docParagraph(state.source, { size: 20, color: "66788C" }));
+  parts.push(docParagraph("Capture", { bold: true, size: 28 }));
+  const facts = [
+    result.sampleRate + " Hz, " + result.count + " samples, " + fmt(seconds, 2) + " s",
+    "Range ±" + ((state.parsed && state.parsed.rangeG) || "?") + " g",
+    "High-pass " + result.highpassHz + " Hz, low-pass " + (result.lowpassHz || "off"),
+    "View " + quantityLabel(quantity).toLowerCase() + ", " + (usesUs() ? "US units" : "metric units"),
+  ];
+  if (result.gate) facts.push("Noise gate " + fmt(result.gate, 3) + " g");
+  if (result.emaAlpha) facts.push("EMA weight " + result.emaAlpha);
+  if (result.vertical) facts.push("Gravity sits mostly on " + result.vertical + " (means " + result.means.map((v) => fmt(v, 3)).join(", ") + " g).");
+  if (state.focus) facts.push("The numbers below use the window on screen, " + state.focus.count + " samples.");
+  facts.forEach((line) => parts.push(docParagraph(line, { size: 22 })));
+
+  const blocks = [
+    ["Acceleration", scaledMetric(state.focus && state.focus.metrics ? state.focus.metrics.accel : result.metrics.accel, "accel"), usesUs() ? 3 : 4, unitName("accel")],
+    ["Velocity", scaledMetric(result.metrics.velocity, "velocity"), 3, unitName("velocity")],
+    ["Displacement", scaledMetric(result.metrics.displacement, "displacement"), usesUs() ? 5 : 2, unitName("displacement")],
+    ["Gyroscope", result.metrics.gyro, 2, "dps"],
+  ];
+  if (state.focus && state.focus.series && quantity !== "accel" && quantity !== "gyro") {
+    const names = { velocity: "Velocity", displacement: "Displacement" };
+    const match = blocks.find((item) => item[0] === names[quantity]);
+    if (match) match[1] = scaledMetric(blockFromSeries(state.focus.series), quantity);
+  }
+  blocks.forEach((item) => {
+    if (!item[1]) return;
+    parts.push(docParagraph(item[0] + " (" + item[3] + ")", { bold: true, size: 26 }));
+    parts.push(docTable(metricRows(item[1], item[2])));
+  });
+
+  const peakList = (state.focus && state.focus.peaks) || result.peaks || [];
+  parts.push(docParagraph("Peaks", { bold: true, size: 28 }));
+  if (peakList.length) {
+    peakList.forEach((peak) => {
+      parts.push(docParagraph(fmt(peak.hz, 2) + " Hz, " + fmt(peak.amp * displayScale(quantity), 4) + " " + unit, { size: 22 }));
+    });
+  } else parts.push(docParagraph("No distinct peaks.", { size: 22 }));
+
+  const resonance = (state.focus && state.focus.resonance) || result.resonance;
+  if (resonance) {
+    parts.push(docParagraph("Resonance", { bold: true, size: 28 }));
+    parts.push(docParagraph(
+      "Natural frequency " + fmt(resonance.hz, 2) + " Hz. Half-power bandwidth " + fmt(resonance.bandwidthHz, 2)
+      + " Hz. Damping ratio " + fmt(resonance.damping, 3) + ". Q " + fmt(resonance.q, 1) + ".",
+      { size: 22 }
+    ));
+  }
+  if (state.baseline) {
+    const base = state.baseline;
+    parts.push(docParagraph("Baseline", { bold: true, size: 28 }));
+    parts.push(docParagraph("Baseline " + (base.label || "capture") + ": " + fmt(base.hz, 2) + " Hz, RSS " + fmt(base.rss, 4) + " g.", { size: 22 }));
+    if (resonance && base.hz && base.amp) {
+      parts.push(docParagraph(
+        "Frequency change " + fmt(resonance.hz - base.hz, 2) + " Hz. Amplitude change "
+        + fmt(100 * (resonance.amp - base.amp) / base.amp, 1) + "%. Damping change " + fmt(resonance.damping - base.damping, 3) + ".",
+        { size: 22 }
+      ));
+    }
+  }
+  if (result.notes && result.notes.length) {
+    parts.push(docParagraph("Notes", { bold: true, size: 28 }));
+    result.notes.forEach((note) => parts.push(docParagraph(note, { size: 22 })));
+  }
+
+  const fs = result.sampleRate || 1;
+  let wave = series;
+  let raw = result.raw;
+  let t0 = 0;
+  let sampleStart = 0;
+  let sampleCount = series.x ? series.x.length : 0;
+  if (view && series.x && fs > 0) {
+    const a = Math.max(0, Math.min(series.x.length, Math.round(view.zoom0 * fs)));
+    const b = Math.max(a, Math.min(series.x.length, Math.round(view.zoom1 * fs)));
+    sampleStart = a;
+    sampleCount = b - a;
+    if (a > 0 || b < series.x.length) {
+      const cut = (src) => src && src.x ? {
+        x: src.x.subarray(a, b),
+        y: src.y ? src.y.subarray(a, b) : src.y,
+        z: src.z ? src.z.subarray(a, b) : src.z,
+      } : src;
+      wave = cut(series);
+      raw = cut(result.raw);
+      t0 = view.zoom0;
+    }
+  }
+  const spectrum = state.focus ? state.focus.spectrum : result.spectrum;
+  const windowAt = view && view.windowed ? [view.start, Math.min(view.dur, view.start + view.span)] : null;
+  const picture = spectrogramSeries(series, sampleStart, sampleCount);
+  const shots = [
+    ["wave.png", "Waveform", () => chartPng((fake) => drawWave(fake, wave, fs, show, {
+      under: raw, windowAt, t0,
+      title: quantityLabel(quantity) + " waveform",
+      yTitle: quantityLabel(quantity) + " (" + unit + ")",
+      yMin: scale.yMin, yMax: scale.yMax, gain: displayScale(quantity), grid: scale.grid,
+    }), 1320, 420)],
+    ["spectrum.png", "Spectrum", () => chartPng((fake) => drawSpectrum(fake, spectrum, $("logSpec").checked, show, {
+      title: quantityLabel(quantity) + " spectrum",
+      yTitle: "Amplitude (" + unit + ")",
+      fMin: scale.fMin, fMax: scale.fMax, yMax: scale.specMax,
+      gain: displayScale(quantity), logF: $("logF") && $("logF").checked, grid: scale.grid,
+      autoPeaks: analyzePeakMarks(spectrum, show, scale),
+    }), 1320, 420)],
+  ];
+  if (picture) {
+    shots.push(["spectrogram.png", "Spectrogram", () => chartPng((fake) => drawSpectrogram(fake, picture, {
+      title: "Spectrogram, RSS", t0, windowAt,
+      fMin: scale.fMin, fMax: scale.fMax, logF: $("logF") && $("logF").checked, grid: scale.grid,
+    }), 1320, 280)]);
+    shots.push(["campbell.png", "Mode tracks", () => chartPng((fake) => drawCampbell(fake, picture, {
+      t0, windowAt, fMin: scale.fMin, fMax: scale.fMax,
+      logF: $("logF") && $("logF").checked, grid: scale.grid,
+    }), 1320, 320)]);
+  }
+  parts.push(docParagraph("Charts", { bold: true, size: 28 }));
+  const images = [];
+  for (let i = 0; i < shots.length; i++) {
+    const png = await shots[i][2]();
+    const rel = "rId" + (10 + i);
+    const cx = 6858000;
+    const cy = Math.round(cx * (shots[i][0].indexOf("spectro") >= 0 ? 280 : shots[i][0].indexOf("campbell") >= 0 ? 320 : 420) / 1320);
+    parts.push(docParagraph(shots[i][1], { bold: true, size: 24 }));
+    parts.push(docImage(rel, shots[i][0], cx, cy, i + 1));
+    images.push({ name: "word/media/" + shots[i][0], data: png, rel, file: shots[i][0] });
+  }
+  parts.push(docParagraph(
+    "BMI270 on an M5Stack StickS3. This is a screening plot, not a calibrated vibration certificate.",
+    { size: 18, color: "66788C" }
+  ));
+  parts.push(docParagraph("Copyright 2026 José Miranda. MIT license.", { size: 18, color: "66788C" }));
+  const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
+<w:body>${parts.join("")}<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720" w:header="360" w:footer="360" w:gutter="0"/></w:sectPr></w:body></w:document>`;
+  const rels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+${images.map((image) => `<Relationship Id="${image.rel}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/${image.file}"/>`).join("")}
+</Relationships>`;
+  const enc = new TextEncoder();
+  const files = [
+    { name: "[Content_Types].xml", data: enc.encode(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Default Extension="png" ContentType="image/png"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>`) },
+    { name: "_rels/.rels", data: enc.encode(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>`) },
+    { name: "word/document.xml", data: enc.encode(documentXml) },
+    { name: "word/_rels/document.xml.rels", data: enc.encode(rels) },
+  ];
+  images.forEach((image) => files.push({ name: image.name, data: image.data }));
+  downloadBlob(zipStore(files), `tremble-${stamp()}.docx`);
+}
+
 function exportPng() {
   const result = state.result;
   const series = selectedSeries();
@@ -2093,6 +3088,7 @@ function exportPng() {
     yMax: scale.specMax,
     grid: scale.grid,
     marks: chartMarks.specCanvas,
+    autoPeaks: analyzePeakMarks(result.spectrum, channelShow(), scale),
   }));
   ctx.drawImage(specShot, 40, 500, 1320, 320);
   specShot.remove();
@@ -2101,6 +3097,8 @@ function exportPng() {
   ctx.fillText("BMI270 on M5Stack StickS3. Screening plot, not a calibrated vibration certificate.", 40, 950);
   canvas.toBlob((blob) => downloadBlob(blob, `tremble-${stamp()}.png`));
 }
+
+/* --- Chart marks, axis editor, and expand modal --- */
 
 function marksFor(canvas, extra) {
   if (extra && extra.marks) return extra.marks;
@@ -2259,10 +3257,13 @@ function bindChart(canvas) {
     if (redraw) redraw();
   });
   canvas.addEventListener("pointermove", (event) => {
-    const probe = chartProbes[canvas.id];
-    if (!probe) return;
-    const marks = ensureMarks(canvas.id);
     const p = at(event);
+    const probe = chartProbes[canvas.id];
+    if (!probe) {
+      canvas.style.cursor = axisAt(canvas, p) ? "pointer" : "crosshair";
+      return;
+    }
+    const marks = ensureMarks(canvas.id);
     chartHoverId = canvas.id;
     if (chartDrag && chartDrag.id === canvas.id) {
       const pt = marks.points.find((item) => item.id === chartDrag.pointId);
@@ -2271,6 +3272,9 @@ function bindChart(canvas) {
         chartDrag.moved = true;
       }
       canvas.style.cursor = "grabbing";
+    } else if (axisAt(canvas, p)) {
+      marks.hover = null;
+      canvas.style.cursor = "pointer";
     } else {
       marks.hover = p;
       canvas.style.cursor = hitMark(probe, marks, p) ? "grab" : "crosshair";
@@ -2278,10 +3282,11 @@ function bindChart(canvas) {
     const redraw = chartRedraw[canvas.id];
     if (redraw) redraw();
   });
-  canvas.addEventListener("pointerup", () => {
+  canvas.addEventListener("pointerup", (event) => {
     if (chartDrag && chartDrag.id === canvas.id && chartDrag.moved) chartSkipClick = true;
     chartDrag = null;
-    canvas.style.cursor = "crosshair";
+    const p = at(event);
+    canvas.style.cursor = axisAt(canvas, p) ? "pointer" : "crosshair";
   });
   canvas.addEventListener("pointerleave", () => {
     if (chartDrag && chartDrag.id === canvas.id) return;
@@ -2293,6 +3298,8 @@ function bindChart(canvas) {
     if (redraw) redraw();
   });
   canvas.addEventListener("click", (event) => {
+    const p = at(event);
+    if (openAxisEditor(canvas, p)) return;
     if (chartSkipClick) {
       chartSkipClick = false;
       return;
@@ -2300,7 +3307,6 @@ function bindChart(canvas) {
     const probe = chartProbes[canvas.id];
     if (!probe) return;
     const marks = ensureMarks(canvas.id);
-    const p = at(event);
     chartHoverId = canvas.id;
     const legend = (probe.frame.legendHits || []).find((hit) => p.x >= hit.x && p.x <= hit.x + hit.w && p.y >= hit.y && p.y <= hit.y + hit.h);
     if (legend) {
@@ -2358,9 +3364,44 @@ function bindChart(canvas) {
   });
 }
 
+let chartHome = null;
+
+function openChart(canvas) {
+  const modal = $("chartModal");
+  const stage = $("chartModalStage");
+  if (!canvas || !modal || !stage) return;
+  if (chartHome && chartHome.canvas === canvas) return;
+  if (chartHome) closeChart();
+  chartHome = { canvas, parent: canvas.parentElement, next: canvas.nextSibling };
+  stage.appendChild(canvas);
+  modal.hidden = false;
+  requestAnimationFrame(() => requestAnimationFrame(drawAll));
+}
+
+function closeChart() {
+  if (!chartHome) return;
+  const { canvas, parent, next } = chartHome;
+  chartHome = null;
+  if (parent) {
+    if (next && next.parentElement === parent) parent.insertBefore(canvas, next);
+    else parent.appendChild(canvas);
+  }
+  const modal = $("chartModal");
+  if (modal) modal.hidden = true;
+  requestAnimationFrame(drawAll);
+}
+
 function bindCharts() {
-  ["liveCanvas", "liveSpecCanvas", "waveCanvas", "specCanvas"].forEach((id) => bindChart($(id)));
+  ["liveCanvas", "liveSpecCanvas", "waveCanvas", "specCanvas", "gramCanvas", "campCanvas"].forEach((id) => bindChart($(id)));
+  document.querySelectorAll(".plot-max").forEach((btn) => {
+    btn.addEventListener("click", () => openChart($(btn.dataset.chart)));
+  });
+  $("chartModalClose").addEventListener("click", closeChart);
+  $("chartModal").addEventListener("click", (event) => {
+    if (event.target === $("chartModal")) closeChart();
+  });
   window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && chartHome) closeChart();
     if (event.key !== "Delete" && event.key !== "Backspace") return;
     const tag = event.target && event.target.tagName;
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
@@ -2396,17 +3437,35 @@ $("calClear").addEventListener("click", () => {
   localStorage.removeItem("tremble-noise");
   renderNoise();
 });
-$("apply").addEventListener("click", () => applySettings().catch((err) => banner(err.message, false)));
+$("apply").addEventListener("click", () => {
+  if ($("apply").disabled) return;
+  state.busy = true;
+  syncApplyBtn();
+  applySettings()
+    .catch((err) => banner(stickDown(err) || "Could not apply those settings.", false))
+    .finally(() => {
+      state.busy = false;
+      syncApplyBtn();
+    });
+});
+["rate", "range", "seconds", "gyro"].forEach((id) => {
+  const el = $(id);
+  if (!el) return;
+  el.addEventListener("input", syncApplyBtn);
+  el.addEventListener("change", syncApplyBtn);
+});
 
+/* Form controls persisted in localStorage (tremble-ui); uiReady gates save during loadUi. */
 const UI_DEFAULTS = {
   units: "metric",
   liveQty: "accel",
   ema: "0",
   gate: "0",
   fftWin: "512",
-  feedRate: "steady",
+  feedRate: "slow",
   logF: false,
   markPeaks: false,
+  analyzePeaks: false,
   decayEnv: false,
   liveSpan: "0",
   liveFmin: "",
@@ -2433,6 +3492,8 @@ const UI_DEFAULTS = {
   fMin: "",
   fMax: "",
   specMax: "",
+  rpmFrom: "",
+  rpmTo: "",
   grid: true,
   rate: "800",
   range: "2",
@@ -2490,7 +3551,7 @@ $("saveWifi").addEventListener("click", () => {
   });
   select.value = id === "mapX" ? "+0" : id === "mapY" ? "+1" : "+2";
 });
-["yMin", "yMax", "fMin", "fMax", "specMax", "tFrom", "tTo", "liveFmin", "liveFmax"].forEach((id) => {
+["yMin", "yMax", "fMin", "fMax", "specMax", "tFrom", "tTo", "rpmFrom", "rpmTo", "liveFmin", "liveFmax"].forEach((id) => {
   $(id).addEventListener("input", () => {
     if (state.result) refreshView();
     else drawAll();
@@ -2539,7 +3600,7 @@ $("units").addEventListener("change", () => {
   renderNoise();
   refreshView();
 });
-["logF", "stftWin", "fftWin", "markPeaks", "liveQty", "decayEnv", "liveSpan"].forEach((id) => {
+["logF", "stftWin", "fftWin", "markPeaks", "analyzePeaks", "liveQty", "decayEnv", "liveSpan"].forEach((id) => {
   $(id).addEventListener("change", () => {
     if (id === "liveQty") {
       syncSignal("live");
@@ -2563,7 +3624,7 @@ $("liveRange").addEventListener("change", () => {
     banner("Range changes after the capture stops.", false);
     return;
   }
-  applySettings().catch((err) => banner(err.message, false));
+  applySettings().catch((err) => banner(stickDown(err) || "Could not apply those settings.", false));
 });
 $("span").addEventListener("change", refreshView);
 $("scrub").addEventListener("input", refreshView);
@@ -2572,15 +3633,19 @@ $("play").addEventListener("click", () => {
     clearInterval(state.playTimer);
     state.playTimer = 0;
     $("play").textContent = "Play";
+    refreshView();
     return;
   }
+  if (!state.result) return;
   $("play").textContent = "Pause";
-  state.playTimer = setInterval(() => {
+  const step = () => {
     let pos = Number($("scrub").value) + 8;
     if (pos > 1000) pos = 0;
     $("scrub").value = String(pos);
     refreshView();
-  }, 120);
+  };
+  state.playTimer = setInterval(step, 120);
+  refreshView();
 });
 $("baseSet").addEventListener("click", () => {
   const result = state.result;
@@ -2617,16 +3682,38 @@ drop.addEventListener("drop", async (event) => {
   await loadBuffer(await file.arrayBuffer(), file.name);
   showTab("analyze");
 });
-$("saveFile").addEventListener("click", async () => {
+async function saveCapture(name) {
+  if (state.fileBusy) return;
+  state.fileBusy = true;
+  syncFileTools();
+  banner("Saving on the Stick…", false);
   try {
-    const saved = await post("/api/files/save", { name: $("fileName").value.trim() });
+    const saved = await post("/api/files/save", { name: (name || "").trim() });
+    state.filesEtag = "";
     banner("Saved " + saved.name + ".vibe on the Stick.", true);
-    refreshFiles();
   } catch (err) {
-    banner(err.message, false);
+    banner(stickDown(err), false);
+  } finally {
+    state.fileBusy = false;
+    try { await refreshFiles(); } catch (err) { syncFileTools(); }
   }
+}
+$("fileAll").addEventListener("change", () => {
+  document.querySelectorAll("#fileList .file-pick input").forEach((box) => {
+    box.checked = $("fileAll").checked;
+  });
+  syncFileTools();
+});
+$("fileDelete").addEventListener("click", () => {
+  deleteCaptures(selectedFileNames());
+});
+$("analyzeSave").addEventListener("click", () => {
+  saveCapture($("analyzeName").value).catch((err) => banner(err.message, false));
 });
 $("expPng").addEventListener("click", exportPng);
+$("expDoc").addEventListener("click", () => {
+  exportDocx().catch((err) => banner(err.message, false));
+});
 $("expCsv").addEventListener("click", exportCsv);
 $("expSpec").addEventListener("click", exportSpectrum);
 $("expJson").addEventListener("click", exportJson);
@@ -2637,8 +3724,8 @@ $("expAll").addEventListener("click", () => {
   setTimeout(exportJson, 800);
 });
 const UI_IDS = [
-  "units", "liveQty", "ema", "gate", "fftWin", "feedRate", "logF", "markPeaks", "decayEnv", "liveSpan", "liveFmin", "liveFmax",
-  "tFrom", "tTo",
+  "units", "liveQty", "ema", "gate", "fftWin", "feedRate", "logF", "markPeaks", "analyzePeaks", "decayEnv", "liveSpan", "liveFmin", "liveFmax",
+  "tFrom", "tTo", "rpmFrom", "rpmTo",
   "hp", "lp", "quantity", "displacement",
   "chX", "chY", "chZ", "chRss", "logSpec", "showRaw",
   "mapX", "mapY", "mapZ", "span", "stftWin",
@@ -2657,6 +3744,10 @@ function saveUi() {
   });
   const tab = document.querySelector("nav.tabs button[aria-selected='true']");
   if (tab) data.tab = tab.dataset.tab;
+  ["chartDock", "liveDock"].forEach((id) => {
+    const el = $(id);
+    if (el) data[id] = el.open;
+  });
   try { localStorage.setItem("tremble-ui", JSON.stringify(data)); } catch (err) { /* private mode */ }
 }
 
@@ -2671,9 +3762,17 @@ function loadUi() {
       else if (data[id] !== "") el.value = String(data[id]);
     });
   }
+  ["chartDock", "liveDock"].forEach((id) => {
+    const el = $(id);
+    if (el) el.open = !!(data && data[id]);
+  });
   labelSliders();
   uiReady = true;
-  if (data && data.tab && data.tab !== "live") showTab(data.tab);
+  syncApplyBtn();
+  if (data && data.tab && data.tab !== "live") {
+    const tab = (data.tab === "files" || data.tab === "capture") ? (data.tab === "files" ? "analyze" : "live") : data.tab;
+    if (tab !== "live") showTab(tab);
+  }
 }
 
 document.addEventListener("input", (event) => {
@@ -2688,14 +3787,51 @@ $("livePause").addEventListener("click", () => {
   $("livePause").setAttribute("aria-pressed", state.paused ? "true" : "false");
 });
 
+["chartDock", "liveDock"].forEach((id) => {
+  const el = $(id);
+  if (!el) return;
+  el.addEventListener("toggle", () => {
+    saveUi();
+    requestAnimationFrame(() => requestAnimationFrame(drawAll));
+  });
+});
 window.addEventListener("resize", drawAll);
+$("axisEdit").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    commitAxisEdit(false);
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    commitAxisEdit(true);
+  }
+});
+$("axisEdit").addEventListener("blur", () => {
+  commitAxisEdit(false);
+});
+document.addEventListener("pointerdown", (event) => {
+  const input = $("axisEdit");
+  if (!input || input.hidden || event.target === input) return;
+  commitAxisEdit(false);
+});
 bindCharts();
 loadUi();
 loadNoise();
 
+/* Boot: restore UI, then start paced polls (status always; live split by softApOnly). */
 drawAll();
 post("/api/time", { epoch: String(Date.now()) }).catch(() => {});
 pollStatus();
-pace(pollStatus, () => feedPace().status);
+pace(pollStatus, () => {
+  const ms = feedPace().status;
+  return pageVisible() ? ms : ms * 2;
+});
 pace(pollLive, (hot) => hot ? feedPace().live : feedPace().idle);
 pace(pollSpectrum, (hot) => hot ? feedPace().spec : feedPace().idle);
+document.addEventListener("visibilitychange", () => {
+  if (!pageVisible()) return;
+  pollStatus().catch(() => {});
+  if ($("live").classList.contains("active")) {
+    pollLive().catch(() => {});
+    pollSpectrum().catch(() => {});
+  }
+});

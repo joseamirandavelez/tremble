@@ -1,32 +1,26 @@
+// USB serial text commands (115200). Lines queue in gPending so parsing and
+// deviceApply never run inside the Serial ISR path. Mirrors most /api actions:
+// start/stop, rate, range, seconds, gyro, wifi, ap on|off.
+
 #include "link.h"
 
 #include "capture.h"
 #include "control.h"
 #include "net.h"
 #include "store.h"
+#include "webapp.h"
 
 #include <Arduino.h>
 #include <stdlib.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
 #include <freertos/portmacro.h>
 #include <stdio.h>
 #include <string.h>
-
-static const char* kService = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-static const char* kRx = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
-static const char* kTx = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 
 static char gLine[96];
 static size_t gLineLen = 0;
 static char gPending[96];
 static volatile bool gHaveCmd = false;
 static portMUX_TYPE gMux = portMUX_INITIALIZER_UNLOCKED;
-static BLECharacteristic* gTx = nullptr;
-static volatile bool gBleConnected = false;
-static uint32_t gLastNote = 0;
-static bool gBleReady = false;
 
 static bool submit(const char* line) {
   portENTER_CRITICAL(&gMux);
@@ -43,35 +37,7 @@ static bool submit(const char* line) {
 
 static void reply(const char* text) {
   Serial.println(text);
-  if (gTx && gBleConnected) {
-    gTx->setValue((uint8_t*)text, strlen(text));
-    gTx->notify();
-  }
 }
-
-class LinkServer : public BLEServerCallbacks {
-  void onConnect(BLEServer*) override { gBleConnected = true; }
-  void onDisconnect(BLEServer* server) override {
-    gBleConnected = false;
-    server->startAdvertising();
-  }
-};
-
-class LinkRx : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* characteristic) override {
-    auto value = characteristic->getValue();
-    char line[96];
-    size_t n = value.length();
-    if (n >= sizeof(line)) n = sizeof(line) - 1;
-    for (size_t i = 0; i < n; i++) {
-      char c = value[i];
-      if (c == '\r' || c == '\n') c = 0;
-      line[i] = c;
-    }
-    line[n] = 0;
-    if (line[0]) submit(line);
-  }
-};
 
 static bool applyCurrent(uint16_t rate, uint8_t range, uint16_t seconds, bool gyro, char* out, size_t n) {
   char err[96];
@@ -87,7 +53,7 @@ static void runCommand(const char* line, char* out, size_t n) {
   while (*line == ' ') line++;
   Settings* settings = settingsLive();
   if (!strcmp(line, "help")) {
-    snprintf(out, n, "status | start | stop | rate 100-1600 | range 2|4|8|16 | seconds 0-120 | gyro on|off | wifi <ssid> <pass>");
+    snprintf(out, n, "status | start | stop | rate 100-1600 | range 2|4|8|16 | seconds 0-120 | gyro on|off | wifi <ssid> <pass> | ap on|off");
     return;
   }
   if (!strcmp(line, "status")) {
@@ -103,6 +69,17 @@ static void runCommand(const char* line, char* out, size_t n) {
   if (!strcmp(line, "stop")) {
     deviceStop();
     snprintf(out, n, "stopped %u", captureCount());
+    return;
+  }
+  if (!strcmp(line, "ap on") || !strcmp(line, "ap start")) {
+    bool ok = netApStart();
+    if (ok) webEnsureBegun();
+    snprintf(out, n, ok ? "ap on" : "ap failed");
+    return;
+  }
+  if (!strcmp(line, "ap off") || !strcmp(line, "ap stop")) {
+    netApStop();
+    snprintf(out, n, netApOn() ? "ap still on" : "ap off");
     return;
   }
   if (!strncmp(line, "rate ", 5)) {
@@ -133,32 +110,25 @@ static void runCommand(const char* line, char* out, size_t n) {
     return;
   }
   if (!strncmp(line, "gyro ", 5)) {
-    bool on = !strcmp(line + 5, "on");
-    bool off = !strcmp(line + 5, "off");
+    bool on = !strcmp(line + 5, "on") || !strcmp(line + 5, "1");
+    bool off = !strcmp(line + 5, "off") || !strcmp(line + 5, "0");
     if (!on && !off) {
-      snprintf(out, n, "gyro on or gyro off");
+      snprintf(out, n, "gyro on|off");
       return;
     }
     applyCurrent(settings->rateHz, settings->rangeG, settings->seconds, on, out, n);
     return;
   }
   if (!strncmp(line, "wifi ", 5)) {
-    const char* rest = line + 5;
-    const char* split = strrchr(rest, ' ');
-    char ssid[33];
-    char pass[65];
-    if (!split || split == rest) {
-      strncpy(ssid, rest, sizeof(ssid) - 1);
-      ssid[sizeof(ssid) - 1] = 0;
-      pass[0] = 0;
-    } else {
-      size_t ssidLen = (size_t)(split - rest);
-      if (ssidLen >= sizeof(ssid)) ssidLen = sizeof(ssid) - 1;
-      memcpy(ssid, rest, ssidLen);
-      ssid[ssidLen] = 0;
-      strncpy(pass, split + 1, sizeof(pass) - 1);
-      pass[sizeof(pass) - 1] = 0;
-    }
+    char ssid[33] = {};
+    char pass[65] = {};
+    const char* p = line + 5;
+    while (*p == ' ') p++;
+    size_t i = 0;
+    while (*p && *p != ' ' && i + 1 < sizeof(ssid)) ssid[i++] = *p++;
+    while (*p == ' ') p++;
+    i = 0;
+    while (*p && i + 1 < sizeof(pass)) pass[i++] = *p++;
     if (strchr(ssid, '"') || strchr(ssid, '\\') || strlen(pass) > 64) {
       snprintf(out, n, "network name rejected");
       return;
@@ -180,23 +150,10 @@ static void runCommand(const char* line, char* out, size_t n) {
 }
 
 void linkBegin() {
-  Serial.println("USB commands: help, status, start, stop, rate, range, seconds, gyro, wifi");
-  BLEDevice::init("Tremble");
-  BLEServer* server = BLEDevice::createServer();
-  server->setCallbacks(new LinkServer());
-  BLEService* service = server->createService(kService);
-  gTx = service->createCharacteristic(kTx, BLECharacteristic::PROPERTY_NOTIFY);
-  BLECharacteristic* rx = service->createCharacteristic(kRx, BLECharacteristic::PROPERTY_WRITE);
-  rx->setCallbacks(new LinkRx());
-  service->start();
-  BLEAdvertising* advertising = BLEDevice::getAdvertising();
-  advertising->addServiceUUID(kService);
-  advertising->setScanResponse(true);
-  advertising->start();
-  gBleReady = true;
-  Serial.println("Bluetooth name Tremble, Nordic UART service");
+  Serial.println("USB commands: help, status, start, stop, rate, range, seconds, gyro, wifi, ap");
 }
 
+// Drain UART in loop(); execute at most one queued command per pass.
 void linkLoop() {
   while (Serial.available()) {
     char c = (char)Serial.read();
@@ -225,15 +182,5 @@ void linkLoop() {
     char out[180];
     runCommand(line, out, sizeof(out));
     reply(out);
-  }
-
-  if (gBleReady && gBleConnected && millis() - gLastNote > 1000) {
-    gLastNote = millis();
-    char out[180];
-    deviceStatus(out, sizeof(out));
-    if (gTx) {
-      gTx->setValue((uint8_t*)out, strlen(out));
-      gTx->notify();
-    }
   }
 }
