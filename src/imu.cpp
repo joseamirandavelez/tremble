@@ -1,3 +1,7 @@
+// BMI270 on the Stick internal I2C bus. Samples arrive through the chip FIFO;
+// a FreeRTOS task on core 0 drains it while Wi-Fi runs. Paused when both
+// SoftAP and STA are down so the bus sleeps with the radio.
+
 #include "imu.h"
 
 #include "capture.h"
@@ -5,6 +9,7 @@
 #include <M5Unified.h>
 #include <math.h>
 #include <string.h>
+#include <atomic>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -39,6 +44,7 @@ static uint8_t gRange = 2;
 static uint8_t gPending[24];
 static size_t gPendingLen = 0;
 static uint32_t gLastDataMs = 0;
+static std::atomic<bool> gPaused{false};
 
 static void setError(const char* msg) {
   strncpy(gError, msg, sizeof(gError) - 1);
@@ -176,12 +182,15 @@ static void drainLocked() {
   uint16_t avail = fifoLength();
   if (avail > 1800) captureAddGaps(1);
   uint8_t raw[180];
-  while (avail >= 7) {
+  // Cap work per call so a busy FIFO cannot starve setup/loop on core 1.
+  int bursts = 0;
+  while (avail >= 7 && bursts < 8) {
     uint16_t n = avail > sizeof(raw) ? sizeof(raw) : avail;
     if (!readN(REG_FIFO_DATA, raw, n)) break;
     parseBytes(raw, n);
     avail = (avail > n) ? (avail - n) : 0;
     if (avail < 7) avail = fifoLength();
+    bursts++;
   }
   if (gOk && gLastDataMs != 0 && millis() - gLastDataMs > 3000) {
     setError("IMU stopped producing samples");
@@ -191,31 +200,61 @@ static void drainLocked() {
 void imuFlushLocked() {
   gPendingLen = 0;
   write8(REG_CMD, CMD_FIFO_FLUSH);
+}
+
+static void flushFifo() {
+  // Never sleep while holding the I2C mutex. The IMU task and Power reads
+  // share it; a delay under the lock starved Wi-Fi at 1600 Hz.
+  busLock();
+  imuFlushLocked();
+  busUnlock();
   vTaskDelay(pdMS_TO_TICKS(5));
+  busLock();
   uint8_t dump[64];
   uint16_t avail = fifoLength();
   if (avail > sizeof(dump)) avail = sizeof(dump);
   if (avail) readN(REG_FIFO_DATA, dump, avail);
   gPendingLen = 0;
+  busUnlock();
 }
 
-static bool configureLocked(uint32_t rateHz, uint8_t rangeG, bool gyro) {
+bool imuConfigure(uint32_t rateHz, uint8_t rangeG, bool gyro) {
   uint8_t odr = odrCode(rateHz);
   if (!odr || (rangeG != 2 && rangeG != 4 && rangeG != 8 && rangeG != 16)) {
     setError("Unsupported rate or range");
     return false;
   }
+
+  busLock();
   if (!probe()) {
+    busUnlock();
     setError("BMI270 not found");
     return false;
   }
+  if (gOk && gRate == rateHz && gRange == rangeG && gGyro == gyro) {
+    busUnlock();
+    return true;
+  }
+  busUnlock();
 
+  // Pause the sampler so reconfigure is the only I2C client for a moment.
+  gPaused.store(true);
+  vTaskDelay(pdMS_TO_TICKS(15));
+  captureHold(500);
+
+  busLock();
   write8(REG_PWR_CONF, 0x00);
+  busUnlock();
   vTaskDelay(pdMS_TO_TICKS(5));
+
+  busLock();
   write8(REG_IF_CONF, 0x00);
   write8(REG_PWR_CTRL, gyro ? 0x06 : 0x04);
+  busUnlock();
   vTaskDelay(pdMS_TO_TICKS(50));
 
+  busLock();
+  // Performance mode (bit7) is required above 400 Hz on BMI270.
   uint8_t conf = (uint8_t)(0x80 | (0x02 << 4) | odr);
   uint8_t rangeReg = (uint8_t)(rangeG == 2 ? 0 : rangeG == 4 ? 1 : rangeG == 8 ? 2 : 3);
   write8(REG_ACC_CONF, conf);
@@ -224,13 +263,9 @@ static bool configureLocked(uint32_t rateHz, uint8_t rangeG, bool gyro) {
     write8(REG_GYR_CONF, conf);
     write8(REG_GYR_RANGE, 0x00);
   }
-  write8(REG_FIFO_DOWNS, 0x80);
-  // FIFO_CONFIG_1: header (0x10) + accel (0x40), plus gyro (0x80) when asked.
+  write8(REG_FIFO_DOWNS, 0x00);
   uint8_t fifoCfg[2] = {0x00, (uint8_t)(gyro ? 0xD0 : 0x50)};
   M5.In_I2C.writeRegister(gAddr, REG_FIFO_CONFIG_0, fifoCfg, 2, I2C_HZ);
-  vTaskDelay(pdMS_TO_TICKS(20));
-  imuFlushLocked();
-
   uint8_t readback = read8(REG_ACC_CONF);
   gRate = rateHz;
   gRange = rangeG;
@@ -240,28 +275,19 @@ static bool configureLocked(uint32_t rateHz, uint8_t rangeG, bool gyro) {
   gLastDataMs = millis();
   gOk = true;
   gError[0] = 0;
+  busUnlock();
 
-  vTaskDelay(pdMS_TO_TICKS(40));
-  drainLocked();
-  if (millis() - gLastDataMs > 30 && captureCount() == 0) {
-    // drain updates lastData when a sample arrives. If none arrived, fail.
-  }
-  if (gLastDataMs == 0 || (readback & 0x0F) != odr) {
-    Serial.printf("ACC_CONF wrote %02X read %02X\n", conf, readback);
-  }
+  flushFifo();
+  captureHold(400);
+  gPaused.store(false);
+
   Serial.printf("BMI270 @ 0x%02X  %u Hz  ±%u g  ACC_CONF %02X\n", gAddr, gRate, gRange, readback);
   if ((readback & 0x0F) != odr) {
+    Serial.printf("ACC_CONF wrote %02X read %02X\n", conf, readback);
     setError("Accelerometer did not accept the sample rate");
     return false;
   }
   return true;
-}
-
-bool imuConfigure(uint32_t rateHz, uint8_t rangeG, bool gyro) {
-  busLock();
-  bool ok = configureLocked(rateHz, rangeG, gyro);
-  busUnlock();
-  return ok;
 }
 
 bool imuBegin(uint32_t rateHz, uint8_t rangeG, bool gyro) {
@@ -273,21 +299,39 @@ bool imuBegin(uint32_t rateHz, uint8_t rangeG, bool gyro) {
 }
 
 void imuService() {
-  if (!gAddr) return;
+  if (!gAddr || gPaused.load()) return;
   busLock();
   if (gOk) drainLocked();
   busUnlock();
 }
 
+static std::atomic<uint32_t> gPollMs{5};
+
+void imuSetPollMs(uint32_t ms) {
+  if (ms < 5) ms = 5;
+  if (ms > 40) ms = 40;
+  gPollMs.store(ms);
+}
+
 static void imuTask(void*) {
   for (;;) {
     imuService();
-    vTaskDelay(pdMS_TO_TICKS(5));
+    // Default 5 ms. SoftAP with a phone attached uses a longer gap.
+    vTaskDelay(pdMS_TO_TICKS(gPollMs.load()));
   }
 }
 
 void imuStartTask() {
-  xTaskCreatePinnedToCore(imuTask, "imu", 8192, nullptr, 5, nullptr, 1);
+  // Core 0 keeps Wi-Fi moving. Priority stays below the Wi-Fi task.
+  xTaskCreatePinnedToCore(imuTask, "imu", 8192, nullptr, 1, nullptr, 0);
+}
+
+void imuSetPaused(bool paused) {
+  gPaused.store(paused);
+}
+
+bool imuPaused() {
+  return gPaused.load();
 }
 
 bool imuOk() { return gOk; }

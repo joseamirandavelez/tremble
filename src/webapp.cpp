@@ -1,3 +1,7 @@
+// HTTP UI and JSON API on port 80. webBegin() is deferred until SoftAP or STA
+// is up (AsyncWebServer faults if Wi-Fi is WIFI_OFF). Static files come from
+// assets.cpp; live endpoints shrink payloads on SoftAP-only links.
+
 #include "webapp.h"
 
 #include "assets.h"
@@ -11,6 +15,8 @@
 #include <ESPAsyncWebServer.h>
 #include <LittleFS.h>
 #include <M5Unified.h>
+#include <WiFi.h>
+#include <esp_heap_caps.h>
 #include <memory>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,9 +30,11 @@ static uint32_t gStorageUsed = 0;
 void webPowerPoll() {
   static uint32_t last = 0;
   uint32_t now = millis();
-  if (last && (uint32_t)(now - last) < 2000) return;
+  if (last && (uint32_t)(now - last) < 5000) return;
   last = now;
   gStorageUsed = storeUsed();
+  // Skip the PMIC read while capturing so the IMU keeps the I2C bus.
+  if (captureRecording()) return;
   busLock();
   int mv = M5.Power.getBatteryVoltage();
   int level = M5.Power.getBatteryLevel();
@@ -48,6 +56,13 @@ struct SendState {
   uint32_t samples;
   uint8_t header[64];
 };
+
+// A quiet socket is closed after 3 seconds. Saving or deleting a capture
+// takes longer than that, so the browser would see "Failed to fetch"
+// unless this request is allowed to stay open until the reply is sent.
+static void holdClient(AsyncWebServerRequest* req) {
+  if (req->client()) req->client()->setRxTimeout(0);
+}
 
 static String field(AsyncWebServerRequest* req, const char* name) {
   if (req->hasParam(name, true)) return req->getParam(name, true)->value();
@@ -100,8 +115,8 @@ static void handleStatus(AsyncWebServerRequest* req) {
       "\"capacity\":%u,\"gaps\":%u,\"truncated\":%s,\"elapsedMs\":%u,"
       "\"rssRms\":%.5f,\"peakRss\":%.5f,\"rms\":[%.5f,%.5f,%.5f],"
       "\"gyro\":%s,\"gyroRms\":[%.4f,%.4f,%.4f],"
-      "\"links\":[\"wifi\",\"usb\",\"ble\"],"
-      "\"apSsid\":\"%s\",\"apPass\":\"%s\",\"apIp\":\"%s\",\"staIp\":\"%s\","
+      "\"links\":[\"wifi\",\"usb\"],"
+      "\"apOn\":%s,\"apSsid\":\"%s\",\"apPass\":\"%s\",\"apIp\":\"%s\",\"staIp\":\"%s\","
       "\"staSsid\":\"%s\",\"staConnected\":%s,\"storageUsed\":%u,\"storageTotal\":%u,"
       "\"psram\":%u,\"lsbPerG\":%.1f,\"battery\":%d,\"batteryMv\":%d,\"charging\":%s}",
       imuOk() ? "true" : "false",
@@ -112,6 +127,7 @@ static void handleStatus(AsyncWebServerRequest* req) {
       live.capacity, live.gaps, live.truncated ? "true" : "false", live.elapsedMs,
       live.rssRms, live.peakRss, live.rms[0], live.rms[1], live.rms[2],
       live.gyro ? "true" : "false", live.gyroRms[0], live.gyroRms[1], live.gyroRms[2],
+      net.apOn ? "true" : "false",
       kApSsid, kApPass, net.apIp, net.staIp, net.staSsid,
       net.staConnected ? "true" : "false",
       gStorageUsed, storeTotal(), (unsigned)ESP.getFreePsram(), live.lsbPerG,
@@ -121,16 +137,17 @@ static void handleStatus(AsyncWebServerRequest* req) {
 
 static void handleLive(AsyncWebServerRequest* req) {
   constexpr uint16_t kMax = 300;
+  // int16 milli-g keeps the SoftAP packet about half the old float size.
   struct Packet {
     float dt;
     uint16_t count;
     uint16_t pad;
-    float xyz[kMax * 3];
+    int16_t xyz[kMax * 3];
   };
   auto packet = std::make_shared<Packet>();
   packet->pad = 0;
-  packet->count = captureCopyWave(packet->xyz, kMax, &packet->dt);
-  size_t bytes = 8u + (size_t)packet->count * 12u;
+  packet->count = captureCopyWaveMilliG(packet->xyz, kMax, &packet->dt);
+  size_t bytes = 8u + (size_t)packet->count * 6u;
   AsyncWebServerResponse* res = req->beginResponse(
       "application/octet-stream", bytes,
       [packet, bytes](uint8_t* buffer, size_t maxLen, size_t index) -> size_t {
@@ -154,7 +171,9 @@ static void handleLiveFft(AsyncWebServerRequest* req) {
   };
   auto packet = std::make_shared<Packet>();
   packet->pad = 0;
-  packet->count = captureCopyRecent(packet->samples, 512, &packet->rate, &packet->lsb);
+  // SoftAP packets stay smaller so the hotspot keeps answering.
+  const uint16_t want = netApOn() && WiFi.status() != WL_CONNECTED ? 256 : 512;
+  packet->count = captureCopyRecent(packet->samples, want, &packet->rate, &packet->lsb);
   size_t bytes = 12u + (size_t)packet->count * 6u;
   AsyncWebServerResponse* res = req->beginResponse(
       "application/octet-stream", bytes,
@@ -170,6 +189,7 @@ static void handleLiveFft(AsyncWebServerRequest* req) {
 }
 
 static void handleSettings(AsyncWebServerRequest* req) {
+  holdClient(req);
   uint16_t rate = 0;
   uint8_t range = 0;
   if (!parseRate(field(req, "rate"), &rate) || !parseRange(field(req, "range"), &range)) {
@@ -189,6 +209,7 @@ static void handleSettings(AsyncWebServerRequest* req) {
 }
 
 static void handleRecord(AsyncWebServerRequest* req) {
+  holdClient(req);
   String action = field(req, "action");
   if (action == "start") {
     char err[96];
@@ -211,6 +232,7 @@ static void handleRecord(AsyncWebServerRequest* req) {
 }
 
 static void handleWifi(AsyncWebServerRequest* req) {
+  holdClient(req);
   String ssid = field(req, "ssid");
   String pass = field(req, "pass");
   if (ssid.length() > 32 || pass.length() > 64 || ssid.indexOf('"') >= 0 || ssid.indexOf('\\') >= 0) {
@@ -242,6 +264,7 @@ static void handleTime(AsyncWebServerRequest* req) {
 }
 
 static void handleCapture(AsyncWebServerRequest* req) {
+  holdClient(req);
   auto* state = new SendState();
   if (!captureTryBeginSend(&state->samples, state->header)) {
     delete state;
@@ -284,8 +307,35 @@ static void handleCapture(AsyncWebServerRequest* req) {
 }
 
 static void handleFiles(AsyncWebServerRequest* req) {
+  holdClient(req);
   StoreEntry entries[24];
   int n = storeList(entries, 24);
+  uint32_t used = storeUsed();
+  uint32_t total = storeTotal();
+  uint32_t hash = 2166136261u;
+  for (int i = 0; i < n; i++) {
+    for (const char* p = entries[i].name; *p; p++) {
+      hash ^= (uint8_t)*p;
+      hash *= 16777619u;
+    }
+    hash ^= entries[i].bytes;
+    hash *= 16777619u;
+  }
+  hash ^= used;
+  hash *= 16777619u;
+  hash ^= (uint32_t)n;
+  char etag[20];
+  snprintf(etag, sizeof(etag), "\"%08lx\"", (unsigned long)hash);
+  if (req->hasHeader("If-None-Match")) {
+    const AsyncWebHeader* inm = req->getHeader("If-None-Match");
+    if (inm && inm->value() == etag) {
+      AsyncWebServerResponse* res = req->beginResponse(304);
+      res->addHeader("ETag", etag);
+      res->addHeader("Cache-Control", "no-cache");
+      req->send(res);
+      return;
+    }
+  }
   String body = "{\"files\":[";
   for (int i = 0; i < n; i++) {
     if (i) body += ',';
@@ -296,14 +346,18 @@ static void handleFiles(AsyncWebServerRequest* req) {
     body += '}';
   }
   body += "],\"used\":";
-  body += String(storeUsed());
+  body += String(used);
   body += ",\"total\":";
-  body += String(storeTotal());
+  body += String(total);
   body += '}';
-  sendJson(req, 200, body);
+  AsyncWebServerResponse* res = req->beginResponse(200, "application/json", body);
+  res->addHeader("ETag", etag);
+  res->addHeader("Cache-Control", "no-cache");
+  req->send(res);
 }
 
 static void handleSave(AsyncWebServerRequest* req) {
+  holdClient(req);
   if (captureRecording() || !captureReady()) {
     sendText(req, 409, "{\"ok\":false,\"error\":\"Finish a capture before saving it\"}");
     return;
@@ -335,29 +389,135 @@ static void handleSave(AsyncWebServerRequest* req) {
 }
 
 static void handleDelete(AsyncWebServerRequest* req) {
-  String stem = field(req, "name");
-  if (!storeDelete(stem.c_str())) {
-    sendText(req, 404, "{\"ok\":false,\"error\":\"File not found\"}");
+  holdClient(req);
+  char names[24][25];
+  int count = 0;
+  bool extra = false;
+  for (size_t i = 0; i < req->params(); i++) {
+    const AsyncWebParameter* param = req->getParam(i);
+    if (!param || param->isFile() || param->name() != "name") continue;
+    if (count >= 24) {
+      extra = true;
+      break;
+    }
+    strncpy(names[count], param->value().c_str(), 24);
+    names[count][24] = 0;
+    if (!storeValidStem(names[count])) {
+      sendText(req, 400, "{\"ok\":false,\"error\":\"Use letters, numbers, dash, or underscore\"}");
+      return;
+    }
+    count++;
+  }
+  if (!count) {
+    sendText(req, 400, "{\"ok\":false,\"error\":\"Choose a file first\"}");
     return;
   }
-  sendText(req, 200, "{\"ok\":true}");
+  if (extra) {
+    sendText(req, 400, "{\"ok\":false,\"error\":\"Delete up to 24 files at a time\"}");
+    return;
+  }
+  int deleted = 0;
+  int failed = 0;
+  for (int i = 0; i < count; i++) {
+    if (storeDelete(names[i])) deleted++;
+    else failed++;
+    delay(1);
+  }
+  char buf[120];
+  if (failed) {
+    snprintf(buf, sizeof(buf),
+             "{\"ok\":false,\"error\":\"%d %s could not be deleted\",\"deleted\":%d,\"failed\":%d}",
+             failed, failed == 1 ? "file" : "files", deleted, failed);
+    sendText(req, 500, buf);
+    return;
+  }
+  snprintf(buf, sizeof(buf), "{\"ok\":true,\"deleted\":%d}", deleted);
+  sendText(req, 200, buf);
 }
 
+struct HeldFile {
+  uint8_t* data = nullptr;
+  size_t size = 0;
+  ~HeldFile() {
+    free(data);
+    data = nullptr;
+  }
+};
+
 static void handleGetFile(AsyncWebServerRequest* req) {
+  holdClient(req);
   String stem = field(req, "name");
-  char path[40];
-  if (!storeExists(stem.c_str()) || !storePath(stem.c_str(), path, sizeof(path))) {
+  char path[64];
+  if (!storePath(stem.c_str(), path, sizeof(path))) {
+    sendText(req, 400, "{\"ok\":false,\"error\":\"Use letters, numbers, dash, or underscore\"}");
+    return;
+  }
+  storeLock();
+  File file = LittleFS.open(path, "r");
+  if (!file) {
+    storeUnlock();
     sendText(req, 404, "{\"ok\":false,\"error\":\"File not found\"}");
     return;
   }
-  req->send(LittleFS, path, "application/octet-stream", true);
+  size_t size = file.size();
+  uint8_t* data = size ? (uint8_t*)heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) : nullptr;
+  if (size && !data) data = (uint8_t*)malloc(size);
+  size_t got = 0;
+  size_t sinceYield = 0;
+  while (data && got < size) {
+    int n = file.read(data + got, size - got);
+    if (n <= 0) break;
+    got += (size_t)n;
+    sinceYield += (size_t)n;
+    if (sinceYield >= 8192) {
+      sinceYield = 0;
+      delay(1);
+    }
+  }
+  file.close();
+  storeUnlock();
+  if (!data || got != size || size < 64) {
+    free(data);
+    sendText(req, 507, "{\"ok\":false,\"error\":\"Could not read that capture\"}");
+    return;
+  }
+  if (memcmp(data, "VIBE", 4) != 0) {
+    free(data);
+    sendText(req, 422, "{\"ok\":false,\"error\":\"That file is not a Tremble capture\"}");
+    return;
+  }
+  // Keep the bytes in PSRAM/heap for the whole reply. Do not stream from
+  // LittleFS with Content-Disposition attachment; that path often sent an
+  // empty body and the browser then said the file was not a capture.
+  auto held = std::make_shared<HeldFile>();
+  held->data = data;
+  held->size = size;
+  AsyncWebServerResponse* res = req->beginResponse(
+      "application/octet-stream", size,
+      [held](uint8_t* buffer, size_t maxLen, size_t index) -> size_t {
+        if (!held->data || index >= held->size || !maxLen) return 0;
+        size_t n = held->size - index;
+        if (n > maxLen) n = maxLen;
+        memcpy(buffer, held->data + index, n);
+        return n;
+      });
+  res->addHeader("Cache-Control", "no-store");
+  req->send(res);
 }
 
 static void redirectHome(AsyncWebServerRequest* req) {
   req->redirect("http://192.168.4.1/");
 }
 
+static bool gWebBegun = false;
+
+void webEnsureBegun() {
+  if (!gWebBegun) webBegin();
+}
+
 void webBegin() {
+  if (gWebBegun) return;
+  gWebBegun = true;
   gServer.on("/", HTTP_GET, [](AsyncWebServerRequest* req) { sendAsset(req, "/"); });
   gServer.on("/app.css", HTTP_GET, [](AsyncWebServerRequest* req) { sendAsset(req, "/app.css"); });
   gServer.on("/app.js", HTTP_GET, [](AsyncWebServerRequest* req) { sendAsset(req, "/app.js"); });
@@ -365,18 +525,20 @@ void webBegin() {
   gServer.on("/icon.svg", HTTP_GET, [](AsyncWebServerRequest* req) { sendAsset(req, "/icon.svg"); });
   gServer.on("/logo.svg", HTTP_GET, [](AsyncWebServerRequest* req) { sendAsset(req, "/logo.svg"); });
   gServer.on("/logo-text.svg", HTTP_GET, [](AsyncWebServerRequest* req) { sendAsset(req, "/logo-text.svg"); });
-  gServer.on("/api/status", HTTP_GET, handleStatus);
-  gServer.on("/api/live", HTTP_GET, handleLive);
-  gServer.on("/api/livefft", HTTP_GET, handleLiveFft);
-  gServer.on("/api/settings", HTTP_POST, handleSettings);
-  gServer.on("/api/record", HTTP_POST, handleRecord);
-  gServer.on("/api/wifi", HTTP_POST, handleWifi);
-  gServer.on("/api/time", HTTP_POST, handleTime);
-  gServer.on("/api/capture.vibe", HTTP_GET, handleCapture);
-  gServer.on("/api/files", HTTP_GET, handleFiles);
-  gServer.on("/api/files/save", HTTP_POST, handleSave);
-  gServer.on("/api/files/delete", HTTP_POST, handleDelete);
-  gServer.on("/api/files/get", HTTP_GET, handleGetFile);
+  // Exact paths only. A plain "/api/files" also matched "/api/files/get" and
+  // Open received the file list JSON instead of the capture bytes.
+  gServer.on(AsyncURIMatcher::exact("/api/status"), HTTP_GET, handleStatus);
+  gServer.on(AsyncURIMatcher::exact("/api/live"), HTTP_GET, handleLive);
+  gServer.on(AsyncURIMatcher::exact("/api/livefft"), HTTP_GET, handleLiveFft);
+  gServer.on(AsyncURIMatcher::exact("/api/settings"), HTTP_POST, handleSettings);
+  gServer.on(AsyncURIMatcher::exact("/api/record"), HTTP_POST, handleRecord);
+  gServer.on(AsyncURIMatcher::exact("/api/wifi"), HTTP_POST, handleWifi);
+  gServer.on(AsyncURIMatcher::exact("/api/time"), HTTP_POST, handleTime);
+  gServer.on(AsyncURIMatcher::exact("/api/capture.vibe"), HTTP_GET, handleCapture);
+  gServer.on(AsyncURIMatcher::exact("/api/files/get"), HTTP_GET, handleGetFile);
+  gServer.on(AsyncURIMatcher::exact("/api/files/save"), HTTP_POST, handleSave);
+  gServer.on(AsyncURIMatcher::exact("/api/files/delete"), HTTP_POST, handleDelete);
+  gServer.on(AsyncURIMatcher::exact("/api/files"), HTTP_GET, handleFiles);
   gServer.on("/generate_204", HTTP_GET, redirectHome);
   gServer.on("/gen_204", HTTP_GET, redirectHome);
   gServer.on("/hotspot-detect.html", HTTP_GET, redirectHome);

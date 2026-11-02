@@ -20,6 +20,11 @@ bool storeBegin();
 uint32_t storeUsed();
 uint32_t storeTotal();
 
+// One flash user at a time. The status poll must not walk the filesystem
+// while a save or delete is writing it.
+void storeLock();
+void storeUnlock();
+
 // name is the stem, without ".vibe" and without a directory.
 bool storeSave(const char* stem, const uint8_t* header, const int16_t* samples, uint32_t count);
 bool storeDelete(const char* stem);

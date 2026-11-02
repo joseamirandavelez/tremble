@@ -1,3 +1,7 @@
+// Sample path: PSRAM ring for finished captures, separate live rings for the
+// waveform (~100 Hz decimated) and FFT window (512 raw XYZ). gDownloads gates
+// concurrent HTTP download/save against buffer reuse.
+
 #include "capture.h"
 
 #include "imu.h"
@@ -6,7 +10,9 @@
 
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
 #include <freertos/portmacro.h>
+#include <freertos/semphr.h>
 #include <math.h>
 #include <string.h>
 #include <atomic>
@@ -72,9 +78,12 @@ static uint16_t gWaveCount = 0;
 static int16_t gRecent[kRecent * 3];
 static uint16_t gRecentPos = 0;
 static uint16_t gRecentCount = 0;
+static float gWaveScratch[kWave * 3];
+static SemaphoreHandle_t gWaveCopyLock = nullptr;
 static float gGyroDc[3] = {0, 0, 0};
 static float gGyroMs[3] = {0, 0, 0};
 static float gGyroRms[3] = {0, 0, 0};
+static int64_t gHoldUs = 0;
 
 static void publishRates() {
   float fc = 0.5f;
@@ -86,7 +95,7 @@ static void publishRates() {
 }
 
 static void resetFilters() {
-  gDc[0] = gDc[1] = gDc[2] = 0;
+  // gDc stays. Zeroing it prints gravity as a spike until the tracker settles.
   gMs[0] = gMs[1] = gMs[2] = 0;
   gRms[0] = gRms[1] = gRms[2] = 0;
   gRss = 0;
@@ -101,6 +110,7 @@ static void resetFilters() {
   gGyroRms[0] = gGyroRms[1] = gGyroRms[2] = 0;
 }
 
+// Prefer ~120 s at 1600 Hz in PSRAM; fall back to 30 s if allocation fails.
 static bool ensureBuf(uint8_t stride) {
   if (stride != 3 && stride != 6) return false;
   if (gBuf && gStride == stride && gCapacity >= 1600u * 10u) return true;
@@ -139,6 +149,7 @@ bool captureApply(uint32_t rateHz, uint8_t rangeG, float lsbPerG, uint16_t secon
     busUnlock();
     return false;
   }
+  bool changed = gRate != rateHz || gRange != rangeG || gGyro != gyro;
   gRate = rateHz;
   gRange = rangeG;
   gLsb = lsbPerG > 1.0f ? lsbPerG : 16384.0f;
@@ -150,9 +161,14 @@ bool captureApply(uint32_t rateHz, uint8_t rangeG, float lsbPerG, uint16_t secon
   if (target < rateHz) target = rateHz;
   gTarget = target;
   publishRates();
-  resetFilters();
+  if (changed) resetFilters();
   busUnlock();
   return true;
+}
+
+void captureHold(uint32_t ms) {
+  int64_t until = esp_timer_get_time() + (int64_t)ms * 1000;
+  if (until > gHoldUs) gHoldUs = until;
 }
 
 bool captureStart() {
@@ -172,8 +188,8 @@ bool captureStart() {
   gFrozenGyro = gGyro;
   gFrozenDps = gLsbDps;
   gEpoch = netEpochNow();
-  resetFilters();
-  imuFlushLocked();
+  // The IMU is already streaming. Flushing the FIFO or clearing the gravity
+  // tracker here produces a spike in the first samples.
   gStartUs = esp_timer_get_time();
   gRecording.store(true);
   busUnlock();
@@ -207,23 +223,21 @@ void captureAddGaps(uint32_t n) {
 }
 
 void capturePush(int16_t x, int16_t y, int16_t z, int16_t gx, int16_t gy, int16_t gz) {
+  if (esp_timer_get_time() < gHoldUs) return;
   float scale = 1.0f / gLsb;
   float axis[3] = {x * scale, y * scale, z * scale};
   float hp[3];
-  float rss2 = 0;
   for (int i = 0; i < 3; i++) {
     gDc[i] += (axis[i] - gDc[i]) * gDcAlpha;
     hp[i] = axis[i] - gDc[i];
     gMs[i] += (hp[i] * hp[i] - gMs[i]) * gRmsAlpha;
-    gRms[i] = sqrtf(gMs[i]);
-    rss2 += gRms[i] * gRms[i];
   }
-  gRss = sqrtf(rss2);
-  float mag = sqrtf(hp[0] * hp[0] + hp[1] * hp[1] + hp[2] * hp[2]);
-  if (mag > gBlockPeak) gBlockPeak = mag;
+  // Peak tracking uses squared magnitude so we skip a sqrt on every sample.
+  float mag2 = hp[0] * hp[0] + hp[1] * hp[1] + hp[2] * hp[2];
+  if (mag2 > gBlockPeak) gBlockPeak = mag2;
   gBlockCount++;
   if (gBlockCount >= gRate) {
-    gPeak = gBlockPeak;
+    gPeak = sqrtf(gBlockPeak);
     gBlockPeak = 0;
     gBlockCount = 0;
   }
@@ -235,13 +249,19 @@ void capturePush(int16_t x, int16_t y, int16_t z, int16_t gx, int16_t gy, int16_
       gGyroDc[i] += (rawg[i] - gGyroDc[i]) * gDcAlpha;
       float hg = rawg[i] - gGyroDc[i];
       gGyroMs[i] += (hg * hg - gGyroMs[i]) * gRmsAlpha;
-      gGyroRms[i] = sqrtf(gGyroMs[i]);
     }
   }
 
   portENTER_CRITICAL(&gLiveMux);
   if (++gDecim >= gDecimN) {
     gDecim = 0;
+    float rss2 = 0;
+    for (int i = 0; i < 3; i++) {
+      gRms[i] = sqrtf(gMs[i]);
+      rss2 += gRms[i] * gRms[i];
+      if (gGyro) gGyroRms[i] = sqrtf(gGyroMs[i]);
+    }
+    gRss = sqrtf(rss2);
     gWave[gWavePos] = {hp[0], hp[1], hp[2]};
     gWavePos = (uint16_t)((gWavePos + 1) % kWave);
     if (gWaveCount < kWave) gWaveCount++;
@@ -326,6 +346,23 @@ uint16_t captureCopyWave(float* xyz, uint16_t max, float* dt) {
   }
   portEXIT_CRITICAL(&gLiveMux);
   if (dt) *dt = (float)gDecimN / (float)gRate;
+  return n;
+}
+
+uint16_t captureCopyWaveMilliG(int16_t* xyz, uint16_t max, float* dt) {
+  // Copy under the live lock, convert outside it. lroundf inside a critical
+  // section starved the IMU task and could reboot the Stick on SoftAP load.
+  if (!gWaveCopyLock) gWaveCopyLock = xSemaphoreCreateMutex();
+  if (max > (uint16_t)kWave) max = (uint16_t)kWave;
+  xSemaphoreTake(gWaveCopyLock, portMAX_DELAY);
+  uint16_t n = captureCopyWave(gWaveScratch, max, dt);
+  for (uint16_t i = 0; i < (uint16_t)(n * 3u); i++) {
+    float v = gWaveScratch[i] * 1000.0f;
+    if (v > 32767.0f) v = 32767.0f;
+    if (v < -32768.0f) v = -32768.0f;
+    xyz[i] = (int16_t)lroundf(v);
+  }
+  xSemaphoreGive(gWaveCopyLock);
   return n;
 }
 
